@@ -1,0 +1,40 @@
+{
+  "id": "race_poc_001",
+  "name": "Circuit des Trois Cols — POC",
+  "distance_km": 12,
+  "type": "mixed",
+  "points": [
+    { "x": 100,  "y": 400, "alt": 200,  "km": 0 },
+    { "x": 300,  "y": 380, "alt": 205,  "km": 0.5 },
+    { "x": 500,  "y": 350, "alt": 220,  "km": 1.2 },
+    { "x": 700,  "y": 300, "alt": 260,  "km": 2.1 },
+    { "x": 850,  "y": 220, "alt": 320,  "km": 3.0 },
+    { "x": 950,  "y": 150, "alt": 390,  "km": 3.8 },
+    { "x": 1000, "y": 100, "alt": 430,  "km": 4.3 },
+    { "x": 1050, "y": 80,  "alt": 450,  "km": 4.6 },
+    { "x": 1150, "y": 100, "alt": 440,  "km": 5.1 },
+    { "x": 1300, "y": 150, "alt": 410,  "km": 5.8 },
+    { "x": 1450, "y": 250, "alt": 350,  "km": 6.7 },
+    { "x": 1550, "y": 350, "alt": 280,  "km": 7.5 },
+    { "x": 1600, "y": 450, "alt": 220,  "km": 8.2 },
+    { "x": 1580, "y": 550, "alt": 230,  "km": 9.0 },
+    { "x": 1500, "y": 620, "alt": 260,  "km": 9.6 },
+    { "x": 1380, "y": 650, "alt": 280,  "km": 10.2 },
+    { "x": 1200, "y": 640, "alt": 270,  "km": 10.8 },
+    { "x": 1000, "y": 600, "alt": 250,  "km": 11.3 },
+    { "x": 800,  "y": 560, "alt": 235,  "km": 11.7 },
+    { "x": 600,  "y": 520, "alt": 220,  "km": 12.0 }
+  ],
+  "segments": [
+    { "from": 0,    "to": 2000,  "type": "flat",       "road_width_m": 8 },
+    { "from": 2000, "to": 5000,  "type": "climb",      "road_width_m": 6 },
+    { "from": 5000, "to": 7000,  "type": "descent",    "road_width_m": 7 },
+    { "from": 7000, "to": 9000,  "type": "flat",       "road_width_m": 8 },
+    { "from": 9000, "to": 12000, "type": "hc_climb",   "road_width_m": 5 }
+  ],
+  "keyPoints": [
+    { "km": 4.6,  "type": "summit",  "name": "Col du Breuil",    "gradient": 7 },
+    { "km": 9.0,  "type": "sprint",  "name": "Sprint intermédiaire" },
+    { "km": 12.0, "type": "finish",  "name": "Arrivée" }
+  ]
+}

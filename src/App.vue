@@ -1,30 +1,29 @@
 <template>
   <div class="app">
-    <!-- Canvas Pixi.js -->
     <canvas ref="canvasEl" class="game-canvas" />
 
-    <!-- HUD Vue -->
     <HUD
       v-if="gameState === 'racing'"
       :rider="rider"
       :dsMessage="dsMessage"
       :currentTimeScale="timeScale"
+      :paused="paused"
       @setEffort="setEffortMode"
       @dsAction="handleDsAction"
       @setTimeScale="setTimeScale"
+      @togglePause="togglePause"
     />
 
-    <!-- Bandeau altimétrique bas d'écran -->
     <div v-if="gameState === 'racing'" class="altimetric-bar">
       <AltimetricProfile
         :track="track"
+        :spline="splineInstance"
         :splinePos="rider.splinePos"
         :width="altWidth"
-        :height="64"
+        :svgHeight="64"
       />
     </div>
 
-    <!-- Écran de départ -->
     <div v-if="gameState === 'start'" class="start-screen">
       <div class="start-card">
         <div class="game-title">🚴 Vélo Manager / Rider</div>
@@ -32,12 +31,16 @@
         <div class="track-info" v-if="track">
           <div class="track-name">{{ track.name }}</div>
           <div class="track-meta">{{ track.distance_km }} km · {{ track.type }}</div>
+          <div class="track-hint">Molette : zoom · Espace : pause</div>
         </div>
         <button class="start-btn" @click="startRace">Démarrer la course</button>
       </div>
     </div>
 
-    <!-- Écran d'arrivée -->
+    <div v-if="paused && gameState === 'racing'" class="pause-overlay">
+      <div class="pause-badge">⏸ PAUSE</div>
+    </div>
+
     <div v-if="gameState === 'finished'" class="finish-screen">
       <div class="finish-card">
         <div class="finish-emoji">🏁</div>
@@ -45,7 +48,7 @@
         <div class="finish-stats">
           <div class="stat-row">
             <span class="stat-label">Temps simulé</span>
-            <span class="stat-value">{{ formatTime(simLoop?.elapsedSimSec ?? 0) }}</span>
+            <span class="stat-value">{{ formatTime(elapsedSimSec) }}</span>
           </div>
           <div class="stat-row">
             <span class="stat-label">Endurance restante</span>
@@ -67,7 +70,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import HUD from './ui/HUD.vue'
 import AltimetricProfile from './ui/AltimetricProfile.vue'
 import { createRider } from './simulation/engine.js'
@@ -76,65 +79,75 @@ import { CatmullRomSpline } from './render/spline.js'
 import { GameRenderer } from './render/renderer.js'
 import trackData from './data/track_poc.json'
 
-// ─── État global ────────────────────────────────────────────────────────────
-const canvasEl = ref(null)
-const gameState = ref('start') // 'start' | 'racing' | 'finished'
-const rider = ref(createRider())
-const dsMessage = ref(null)
-const timeScale = ref(1)
-const altWidth = computed(() => Math.min(600, window.innerWidth - 40))
+// ─── État ────────────────────────────────────────────────────────────────────
+const canvasEl      = ref(null)
+const gameState     = ref('start')
+const rider         = ref(createRider())
+const dsMessage     = ref(null)
+const timeScale     = ref(1)
+const paused        = ref(false)
+const elapsedSimSec = ref(0)
+const splineInstance = ref(null)   // ref reactive pour passer au composant
 
-const track = ref(trackData)
-let spline = null
+const altWidth = computed(() => Math.min(600, window.innerWidth - 40))
+const track    = ref(trackData)
+
 let renderer = null
-let simLoop = null
-let dsTimer = null
-let renderLoop = null
+let simLoop  = null
+let dsTimer  = null
+let rafId    = null
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 onMounted(() => {
   renderer = new GameRenderer(canvasEl.value)
-  spline = new CatmullRomSpline(track.value.points.map(p => ({
-    ...p,
-    // Coordonnées en pixels (scale: 1km = ~100px pour ce tracé)
-    x: p.x,
-    y: p.y,
-  })))
+
+  const spline = new CatmullRomSpline(track.value.points)
+  splineInstance.value = spline
 
   renderer.drawRoad(spline, track.value.segments)
   renderer.initRider(rider.value)
 
-  // Render loop (60 FPS) — indépendant du tick rate
-  const loop = () => {
+  const renderLoop = () => {
     renderer.updateRider(rider.value, spline)
-    renderLoop = requestAnimationFrame(loop)
+    rafId = requestAnimationFrame(renderLoop)
   }
-  renderLoop = requestAnimationFrame(loop)
+  rafId = requestAnimationFrame(renderLoop)
+
+  window.addEventListener('keydown', onKeyDown)
 })
 
 onUnmounted(() => {
   simLoop?.stop()
   renderer?.destroy()
   clearTimeout(dsTimer)
-  if (renderLoop) cancelAnimationFrame(renderLoop)
+  if (rafId) cancelAnimationFrame(rafId)
+  window.removeEventListener('keydown', onKeyDown)
 })
+
+function onKeyDown(e) {
+  if (e.code === 'Space' && gameState.value === 'racing') {
+    e.preventDefault()
+    togglePause()
+  }
+}
 
 // ─── Démarrage ───────────────────────────────────────────────────────────────
 function startRace() {
   gameState.value = 'racing'
+  paused.value    = false
 
+  const spline = splineInstance.value
   const routeAdapter = {
-    totalLength: spline.totalLength,
+    totalLength:   spline.totalLength,
     getGradientAt: (pos) => spline.getGradientAt(pos),
   }
 
   simLoop = new SimulationLoop({
     rider: rider.value,
     route: routeAdapter,
-    onTick: ({ rider: r, elapsedSimSec, finished }) => {
-      if (finished) {
-        gameState.value = 'finished'
-      }
+    onTick: ({ elapsedSimSec: sec, finished }) => {
+      elapsedSimSec.value = sec
+      if (finished) gameState.value = 'finished'
     },
   })
 
@@ -142,7 +155,7 @@ function startRace() {
   scheduleDsMessage()
 }
 
-// ─── Actions joueur ──────────────────────────────────────────────────────────
+// ─── Contrôles ───────────────────────────────────────────────────────────────
 function setEffortMode(mode) {
   rider.value.effortMode = mode
 }
@@ -152,60 +165,55 @@ function setTimeScale(scale) {
   simLoop?.setTimeScale(scale)
 }
 
+function togglePause() {
+  if (!simLoop) return
+  paused.value = simLoop.pause()
+}
+
 // ─── Radio DS ────────────────────────────────────────────────────────────────
 function scheduleDsMessage() {
-  const delay = 15000 + Math.random() * 20000 // 15–35s
+  const delay = (15 + Math.random() * 20) * 1000
   dsTimer = setTimeout(async () => {
+    if (gameState.value !== 'racing') return
     await triggerDsMessage()
   }, delay)
 }
 
 async function triggerDsMessage() {
-  try {
-    const context = {
-      splinePos: rider.value.splinePos,
-      speedKmh: rider.value.speedKmh,
-      endurancePct: Math.round((rider.value.energy.endurance.current / rider.value.energy.endurance.max) * 100),
-      wPrimePct: Math.round((rider.value.energy.wPrime.current / rider.value.energy.wPrime.max) * 100),
-      zone: rider.value.energy.zone,
-      effortMode: rider.value.effortMode,
-    }
-
-    let text
-    if (window.electronAPI) {
-      const res = await window.electronAPI.slmGenerate({ context, dsProfile: 'encourageant' })
-      text = res.text
-    } else {
-      // Fallback navigateur (dev sans Electron)
-      const messages = [
-        'Reste dans ta roue, économise tes forces.',
-        'Attention, la montée arrive dans 2 km. Passe en mode Éco.',
-        'Beau travail. Continue à ce rythme.',
-        'Ne te laisse pas distancer, reviens dans le groupe.',
-        'Tu as les jambes aujourd\'hui. Attaque si tu te sens bien.',
-        `Énergie à ${context.endurancePct}%, gère bien jusqu'à l'arrivée.`,
-      ]
-      text = messages[Math.floor(Math.random() * messages.length)]
-    }
-
-    dsMessage.value = { text, timestamp: Date.now() }
-
-    // Auto-dismiss après 12s
-    setTimeout(() => {
-      if (dsMessage.value?.timestamp === dsMessage.value?.timestamp) {
-        dsMessage.value = null
-      }
-    }, 12000)
-
-    if (gameState.value === 'racing') scheduleDsMessage()
-  } catch (e) {
-    console.warn('DS message error:', e)
+  const r      = rider.value
+  const spline = splineInstance.value
+  const context = {
+    kmDone:       spline ? spline.getKmAt(r.splinePos).toFixed(1) : '?',
+    speedKmh:     r.speedKmh.toFixed(0),
+    endurancePct: Math.round((r.energy.endurance.current / r.energy.endurance.max) * 100),
+    wPrimePct:    Math.round((r.energy.wPrime.current / r.energy.wPrime.max) * 100),
+    zone:         r.energy.zone,
+    effortMode:   r.effortMode,
+    gradient:     spline ? spline.getGradientAt(r.splinePos).toFixed(1) : '0',
   }
+
+  let text
+  if (window.electronAPI) {
+    const res = await window.electronAPI.slmGenerate({ context, dsProfile: 'encourageant' })
+    text = res.text
+  } else {
+    const msgs = [
+      'Reste dans ta roue, économise tes forces.',
+      'Attention, la montée arrive. Passe en mode Éco.',
+      'Beau travail. Continue à ce rythme.',
+      `Endurance à ${context.endurancePct}% — gère bien jusqu'à l'arrivée.`,
+      `Tu as les jambes aujourd'hui. Attaque si tu te sens bien.`,
+      `${context.kmDone} km parcourus. Bon rythme.`,
+    ]
+    text = msgs[Math.floor(Math.random() * msgs.length)]
+  }
+
+  dsMessage.value = { text, timestamp: Date.now() }
+  setTimeout(() => { dsMessage.value = null }, 12000)
+  if (gameState.value === 'racing') scheduleDsMessage()
 }
 
-function handleDsAction(action) {
-  // TODO Phase 1 : impacter la relation DS selon l'action
-  console.log('DS action:', action)
+function handleDsAction() {
   dsMessage.value = null
 }
 
@@ -213,45 +221,34 @@ function handleDsAction(action) {
 function resetRace() {
   simLoop?.stop()
   clearTimeout(dsTimer)
-  dsMessage.value = null
-  rider.value = createRider()
+  dsMessage.value     = null
+  paused.value        = false
+  elapsedSimSec.value = 0
+  rider.value         = createRider()
   renderer.initRider(rider.value)
-  gameState.value = 'start'
+  gameState.value     = 'start'
 }
 
-// ─── Utilitaires ─────────────────────────────────────────────────────────────
 function formatTime(totalSec) {
   const h = Math.floor(totalSec / 3600)
   const m = Math.floor((totalSec % 3600) / 60)
   const s = totalSec % 60
   return h > 0
-    ? `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`
-    : `${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`
+    ? `${h}h${String(m).padStart(2,'0')}m${String(s).padStart(2,'0')}s`
+    : `${String(m).padStart(2,'0')}m${String(s).padStart(2,'0')}s`
 }
 </script>
 
 <style>
 html, body, #app, .app {
-  width: 100vw;
-  height: 100vh;
-  margin: 0;
-  padding: 0;
+  width: 100vw; height: 100vh;
+  margin: 0; padding: 0;
   overflow: hidden;
   background: #1a1a2e;
 }
+.app { position: relative; }
+.game-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 
-.app {
-  position: relative;
-}
-
-.game-canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-}
-
-/* Bandeau altimétrique */
 .altimetric-bar {
   position: absolute;
   bottom: 16px;
@@ -259,88 +256,53 @@ html, body, #app, .app {
   transform: translateX(-50%);
 }
 
-/* Écrans de menu */
+.pause-overlay {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+}
+.pause-badge {
+  font-size: 22px; font-weight: 700;
+  color: rgba(255,255,255,0.85);
+  background: rgba(0,0,0,0.55);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 12px;
+  padding: 10px 28px;
+  backdrop-filter: blur(4px);
+  letter-spacing: 3px;
+}
+
 .start-screen, .finish-screen {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
   background: rgba(0,0,0,0.6);
   backdrop-filter: blur(4px);
 }
-
 .start-card, .finish-card {
-  background: rgba(15, 15, 30, 0.95);
+  background: rgba(15,15,30,0.95);
   border: 1px solid rgba(255,255,255,0.15);
   border-radius: 16px;
   padding: 40px 48px;
   text-align: center;
   min-width: 320px;
 }
-
-.game-title {
-  font-size: 28px;
-  font-weight: 700;
-  color: #fff;
-  margin-bottom: 4px;
-}
-
-.game-subtitle {
-  font-size: 12px;
-  color: rgba(255,255,255,0.4);
-  text-transform: uppercase;
-  letter-spacing: 2px;
-  margin-bottom: 24px;
-}
-
-.track-info {
-  background: rgba(255,255,255,0.05);
-  border-radius: 8px;
-  padding: 12px 16px;
-  margin-bottom: 24px;
-}
-
-.track-name {
-  font-size: 16px;
-  color: #fff;
-  font-weight: 600;
-}
-
-.track-meta {
-  font-size: 12px;
-  color: rgba(255,255,255,0.5);
-  margin-top: 4px;
-}
-
+.game-title    { font-size: 28px; font-weight: 700; color: #fff; margin-bottom: 4px; }
+.game-subtitle { font-size: 12px; color: rgba(255,255,255,0.4); text-transform: uppercase; letter-spacing: 2px; margin-bottom: 24px; }
+.track-info    { background: rgba(255,255,255,0.05); border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; }
+.track-name    { font-size: 16px; color: #fff; font-weight: 600; }
+.track-meta    { font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 4px; }
+.track-hint    { font-size: 10px; color: rgba(255,255,255,0.3); margin-top: 6px; letter-spacing: 0.5px; }
 .start-btn {
-  background: #3b82f6;
-  border: none;
-  border-radius: 8px;
-  padding: 12px 32px;
-  font-size: 16px;
-  font-weight: 600;
-  color: #fff;
-  cursor: pointer;
-  transition: all 0.15s;
-  width: 100%;
+  background: #3b82f6; border: none; border-radius: 8px;
+  padding: 12px 32px; font-size: 16px; font-weight: 600;
+  color: #fff; cursor: pointer; transition: all 0.15s; width: 100%;
 }
-
 .start-btn:hover { background: #2563eb; transform: translateY(-1px); }
 
-/* Finish screen */
-.finish-emoji { font-size: 48px; margin-bottom: 8px; }
-.finish-title { font-size: 24px; font-weight: 700; color: #fff; margin-bottom: 20px; }
-
-.finish-stats { text-align: left; margin-bottom: 24px; }
-
-.stat-row {
-  display: flex;
-  justify-content: space-between;
-  padding: 6px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.06);
-}
-
-.stat-label { font-size: 12px; color: rgba(255,255,255,0.5); }
-.stat-value { font-size: 12px; color: #fff; font-weight: 600; }
+.finish-emoji  { font-size: 48px; margin-bottom: 8px; }
+.finish-title  { font-size: 24px; font-weight: 700; color: #fff; margin-bottom: 20px; }
+.finish-stats  { text-align: left; margin-bottom: 24px; }
+.stat-row      { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+.stat-label    { font-size: 12px; color: rgba(255,255,255,0.5); }
+.stat-value    { font-size: 12px; color: #fff; font-weight: 600; }
 </style>

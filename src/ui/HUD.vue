@@ -74,6 +74,15 @@
         </button>
       </div>
 
+      <!-- Pause -->
+      <button
+        class="pause-btn"
+        :class="{ paused: paused }"
+        @click="$emit('togglePause')"
+      >
+        {{ paused ? '▶ Reprendre' : '⏸ Pause' }}
+      </button>
+
       <!-- Vitesse accélération simulation -->
       <div class="timescale-block">
         <div class="panel-title" style="margin-top:12px">Vitesse sim</div>
@@ -114,9 +123,10 @@ const props = defineProps({
   rider: { type: Object, required: true },
   dsMessage: { type: Object, default: null },
   currentTimeScale: { type: Number, default: 1 },
+  paused: { type: Boolean, default: false },
 })
 
-defineEmits(['setEffort', 'dsAction', 'setTimeScale'])
+defineEmits(['setEffort', 'dsAction', 'setTimeScale', 'togglePause'])
 
 const endurancePct = computed(() => {
   const e = props.rider.energy.endurance
@@ -348,6 +358,27 @@ const timeScales = [1, 5, 10, 30]
 .btn-zone {
   font-size: 10px;
   color: rgba(255,255,255,0.4);
+}
+
+.pause-btn {
+  width: 100%;
+  margin-top: 10px;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 6px;
+  padding: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.7);
+  cursor: pointer;
+  transition: all 0.15s;
+  letter-spacing: 0.5px;
+}
+.pause-btn:hover { background: rgba(255,255,255,0.14); }
+.pause-btn.paused {
+  background: rgba(251,191,36,0.15);
+  border-color: #fbbf24;
+  color: #fbbf24;
 }
 
 /* Time scale */

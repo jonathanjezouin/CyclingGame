@@ -65,29 +65,29 @@ export class SimulationLoop {
       if (!this.paused) {
         this._accumulator += realDt * this.timeScale
 
-        // Traite les ticks (max 60 par frame)
+        // Traite les ticks (max 120 par frame)
         let ticks = 0
-        while (this._accumulator >= 1 && ticks < 60) {
-          this._prevSimPos = this.rider.splinePos
+        while (this._accumulator >= 1 && ticks < 120) {
+          // Stocker la position juste avant le dernier tick
+          this._posBeforeLastTick = this.rider.splinePos
           simulateTick(this.rider, this.route, 1)
-          this._nextSimPos = this.rider.splinePos
+          this._posAfterLastTick = this.rider.splinePos
           this.elapsedSimSec++
           this._accumulator -= 1
           ticks++
         }
 
-        // Progression entre ticks pour interpolation (0 → 1)
-        this._tickProgress = Math.min(this._accumulator, 1)
-
-        // Interpolation douce de la position de rendu
-        const simSpeed = this.rider.speedKmh / 3.6  // m/s
-        // Position interpolée : on anticipe la distance qui sera parcourue
-        // pendant la fraction de tick restante
-        const interpDist = simSpeed * (this._tickProgress / this.timeScale)
-        this.rider.renderPos = Math.min(
-          this.rider.splinePos + interpDist,
-          this.route.totalLength
-        )
+        // Interpolation entre le début et la fin du dernier tick simulé.
+        // _accumulator est la fraction [0,1[ du tick en cours (pas encore simulé).
+        // On interpole entre posBeforeLastTick et posAfterLastTick.
+        // Cela produit un mouvement continu à toutes les vitesses de simulation.
+        if (this._posBeforeLastTick !== undefined) {
+          const t = Math.min(this._accumulator, 1)  // fraction du tick courant
+          this.rider.renderPos = this._posBeforeLastTick +
+            (this._posAfterLastTick - this._posBeforeLastTick) * t
+        } else {
+          this.rider.renderPos = this.rider.splinePos
+        }
 
         if (ticks > 0) {
           this.onTick({ rider: this.rider, elapsedSimSec: this.elapsedSimSec })

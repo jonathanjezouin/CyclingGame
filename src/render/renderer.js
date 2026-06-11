@@ -13,8 +13,8 @@ const ROAD_WIDTH_M  = 7                   // largeur uniforme en mètres
 const ROAD_WIDTH_PX = ROAD_WIDTH_M * SCALE // 70px à zoom 1.0
 
 // Dimensions sprite en pixels (à l'échelle)
-const RIDER_LENGTH_M = 1.8
-const RIDER_WIDTH_M  = 0.5
+const RIDER_LENGTH_M = 1.9   // longueur vélo+coureur (m)
+const RIDER_WIDTH_M  = 0.75  // largeur guidon compris (m) — légèrement majorée pour lisibilité
 
 export class GameRenderer {
   constructor(canvasEl) {

@@ -36,12 +36,14 @@ export function createRider(overrides = {}) {
   return {
     id: 'rider_001',
     name: 'Marco Deluca',
+    isPlayer: true,
     // Niveau 1 — simulation
     splinePos: 0,
-    group: 'solo',
+    renderPos: 0,
+    group: 'peloton',
     rankInGroup: 1,
-    // Niveau 2 — rendu Zoom 3 (non utilisé au POC)
-    lateralOffset: 0,
+    // Niveau 2 — rendu Zoom 3
+    lateralOffset: 0.8,     // joueur légèrement à droite du centre
     targetWheel: null,
     ellipse: { long: 2.5, lat: 0.8 },
     // Énergie
@@ -59,6 +61,29 @@ export function createRider(overrides = {}) {
     distanceTravelled: 0,
     ...overrides,
   }
+}
+
+/**
+ * Crée un coureur IA avec un profil simple.
+ * L'IA roule à puissance constante (effortMode fixe, pas d'input joueur).
+ */
+export function createAIRider(overrides = {}) {
+  return createRider({
+    id: 'rider_ai_001',
+    name: 'Lucas Ferrer',
+    isPlayer: false,
+    lateralOffset: -0.8,    // côté gauche de la route
+    energy: {
+      endurance:  { current: 3600, max: 3600 },
+      wPrime:     { current: 25000, max: 25000 },
+      zone:       2,
+      ftpWatts:   265,       // légèrement plus faible que le joueur
+      exploded:   false,
+      dayFormMod: 1.0,
+    },
+    effortMode: 'maintien',
+    ...overrides,
+  })
 }
 
 // ─── Calcul de vitesse (physique simplifiée) ─────────────────────────────────

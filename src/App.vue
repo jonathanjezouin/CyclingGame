@@ -4,7 +4,7 @@
 
     <HUD
       v-if="gameState === 'racing'"
-      :rider="rider"
+      :rider="playerRider"
       :dsMessage="dsMessage"
       :currentTimeScale="timeScale"
       :paused="paused"
@@ -18,12 +18,13 @@
       <AltimetricProfile
         :track="track"
         :spline="splineInstance"
-        :splinePos="rider.splinePos"
+        :splinePos="playerRider.splinePos"
         :width="altWidth"
         :svgHeight="64"
       />
     </div>
 
+    <!-- Écran de départ -->
     <div v-if="gameState === 'start'" class="start-screen">
       <div class="start-card">
         <div class="game-title">🚴 Vélo Manager / Rider</div>
@@ -37,10 +38,12 @@
       </div>
     </div>
 
+    <!-- Pause overlay -->
     <div v-if="paused && gameState === 'racing'" class="pause-overlay">
       <div class="pause-badge">⏸ PAUSE</div>
     </div>
 
+    <!-- Écran d'arrivée -->
     <div v-if="gameState === 'finished'" class="finish-screen">
       <div class="finish-card">
         <div class="finish-emoji">🏁</div>
@@ -52,13 +55,13 @@
           </div>
           <div class="stat-row">
             <span class="stat-label">Endurance restante</span>
-            <span class="stat-value">{{ Math.round((rider.energy.endurance.current / rider.energy.endurance.max) * 100) }}%</span>
+            <span class="stat-value">{{ Math.round((playerRider.energy.endurance.current / playerRider.energy.endurance.max) * 100) }}%</span>
           </div>
           <div class="stat-row">
             <span class="stat-label">W' restant</span>
-            <span class="stat-value">{{ Math.round((rider.energy.wPrime.current / rider.energy.wPrime.max) * 100) }}%</span>
+            <span class="stat-value">{{ Math.round((playerRider.energy.wPrime.current / playerRider.energy.wPrime.max) * 100) }}%</span>
           </div>
-          <div class="stat-row" v-if="rider.energy.exploded">
+          <div class="stat-row" v-if="playerRider.energy.exploded">
             <span class="stat-label">⚠ Défaillance</span>
             <span class="stat-value" style="color:#ef4444">Oui</span>
           </div>
@@ -73,24 +76,31 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import HUD from './ui/HUD.vue'
 import AltimetricProfile from './ui/AltimetricProfile.vue'
-import { createRider } from './simulation/engine.js'
+import { createRider, createAIRider } from './simulation/engine.js'
 import { SimulationLoop } from './simulation/loop.js'
 import { CatmullRomSpline } from './render/spline.js'
 import { GameRenderer } from './render/renderer.js'
 import trackData from './data/track_poc.json'
 
 // ─── État ────────────────────────────────────────────────────────────────────
-const canvasEl      = ref(null)
-const gameState     = ref('start')
-const rider         = ref(createRider())
-const dsMessage     = ref(null)
-const timeScale     = ref(1)
-const paused        = ref(false)
-const elapsedSimSec = ref(0)
-const splineInstance = ref(null)   // ref reactive pour passer au composant
+const canvasEl       = ref(null)
+const gameState      = ref('start')
+const dsMessage      = ref(null)
+const timeScale      = ref(1)
+const paused         = ref(false)
+const elapsedSimSec  = ref(0)
+const splineInstance = ref(null)
 
-const altWidth = computed(() => Math.min(600, window.innerWidth - 40))
 const track    = ref(trackData)
+const altWidth = computed(() => Math.min(600, window.innerWidth - 40))
+
+// Coureurs — tableau réactif
+const riders = ref([
+  createRider(),
+  createAIRider(),
+])
+
+const playerRider = computed(() => riders.value.find(r => r.isPlayer))
 
 let renderer = null
 let simLoop  = null
@@ -104,11 +114,13 @@ onMounted(() => {
   const spline = new CatmullRomSpline(track.value.points)
   splineInstance.value = spline
 
-  renderer.drawRoad(spline, track.value.segments)
-  renderer.initRider(rider.value)
+  // Passer la largeur uniforme au renderer (pas de segments de largeur variable)
+  renderer.drawRoad(spline)
+  renderer.initRiders(riders.value.map(r => ({ id: r.id, isPlayer: r.isPlayer })))
 
+  // Render loop 60 FPS
   const renderLoop = () => {
-    renderer.updateRider(rider.value, spline)
+    renderer.updateRiders(riders.value, spline, playerRider.value?.id)
     rafId = requestAnimationFrame(renderLoop)
   }
   rafId = requestAnimationFrame(renderLoop)
@@ -143,8 +155,8 @@ function startRace() {
   }
 
   simLoop = new SimulationLoop({
-    rider: rider.value,
-    route: routeAdapter,
+    riders: riders.value,
+    route:  routeAdapter,
     onTick: ({ elapsedSimSec: sec, finished }) => {
       elapsedSimSec.value = sec
       if (finished) gameState.value = 'finished'
@@ -157,7 +169,8 @@ function startRace() {
 
 // ─── Contrôles ───────────────────────────────────────────────────────────────
 function setEffortMode(mode) {
-  rider.value.effortMode = mode
+  const p = riders.value.find(r => r.isPlayer)
+  if (p) p.effortMode = mode
 }
 
 function setTimeScale(scale) {
@@ -180,7 +193,7 @@ function scheduleDsMessage() {
 }
 
 async function triggerDsMessage() {
-  const r      = rider.value
+  const r      = playerRider.value
   const spline = splineInstance.value
   const context = {
     kmDone:       spline ? spline.getKmAt(r.splinePos).toFixed(1) : '?',
@@ -224,9 +237,10 @@ function resetRace() {
   dsMessage.value     = null
   paused.value        = false
   elapsedSimSec.value = 0
-  rider.value         = createRider()
-  renderer.initRider(rider.value)
-  gameState.value     = 'start'
+
+  riders.value = [ createRider(), createAIRider() ]
+  renderer.initRiders(riders.value.map(r => ({ id: r.id, isPlayer: r.isPlayer })))
+  gameState.value = 'start'
 }
 
 function formatTime(totalSec) {

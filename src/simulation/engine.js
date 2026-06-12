@@ -14,6 +14,11 @@ const PHYSICS = {
   mass: 75,         // masse coureur+vélo kg
 }
 
+// Durée de la défaillance W' (crampe locale) quand W' atteint 0, en ticks (= s)
+const W_FAIL_DURATION_TICKS = 10
+// Puissance bridée pendant la défaillance W' (fraction du FTP)
+const W_FAIL_POWER_FACTOR = 0.50
+
 // ─── Zones d'effort ─────────────────────────────────────────────────────────
 export const ZONES = {
   Z1: { id: 1, name: 'Récupération', ftpMin: 0,   ftpMax: 0.55, color: '#60a5fa', label: 'Z1' },
@@ -25,6 +30,9 @@ export const ZONES = {
 }
 
 // ─── Modes POC → zones cibles ───────────────────────────────────────────────
+// Note : 'attaque' à 1.15 FTP soutenu donne Z5 (effort prolongé d'attaque).
+// Le Z6 ponctuel relève de l'action 'Sprinter' (déclenchement unique, Phase 1),
+// pas d'un mode d'effort continu.
 export const EFFORT_MODES = {
   eco:      { label: 'Éco',     ftpFactor: 0.65, zone: ZONES.Z2, color: '#34d399' },
   maintien: { label: 'Maintien',ftpFactor: 0.85, zone: ZONES.Z3, color: '#fbbf24' },
@@ -52,7 +60,8 @@ export function createRider(overrides = {}) {
       wPrime:     { current: 25000, max: 25000 },
       zone:       2,
       ftpWatts:   280,
-      exploded:   false,
+      exploded:   false,      // explosion Endurance — irréversible sur la course
+      wFailTicks: 0,          // ticks restants de défaillance W' (crampe locale)
       dayFormMod: 1.0,
     },
     // État courant
@@ -79,6 +88,7 @@ export function createAIRider(overrides = {}) {
       zone:       2,
       ftpWatts:   265,       // légèrement plus faible que le joueur
       exploded:   false,
+      wFailTicks: 0,
       dayFormMod: 1.0,
     },
     effortMode: 'maintien',
@@ -150,9 +160,10 @@ export function applyEnergy(rider, powerWatts, dtSec = 1) {
     energy.wPrime.current = Math.max(0, energy.wPrime.current - wRate * dtSec)
     // Consomme aussi Endurance plus vite
     energy.endurance.current = Math.max(0, energy.endurance.current - 2 * dtSec)
-    // Explosion si W' à 0
-    if (energy.wPrime.current <= 0) {
-      // Défaillance temporaire — pas d'explosion totale au POC, juste W' à plat
+    // Défaillance W' : si W' atteint 0, crampe locale pendant N ticks
+    // (puissance bridée, cf. simulateTick). Récupération partielle ensuite.
+    if (energy.wPrime.current <= 0 && energy.wFailTicks <= 0) {
+      energy.wFailTicks = W_FAIL_DURATION_TICKS
     }
   }
 
@@ -162,13 +173,19 @@ export function applyEnergy(rider, powerWatts, dtSec = 1) {
   }
 }
 
+/**
+ * Zone (1-6) à partir du ratio puissance/FTP.
+ * Dérivé de la table ZONES — source de vérité unique pour les seuils.
+ * Les bornes ftpMax de la table sont inclusives ; on retourne la première
+ * zone dont ftpMax couvre le ratio.
+ */
+const _ZONES_ORDERED = Object.values(ZONES).sort((a, b) => a.id - b.id)
+
 export function getZoneFromFtpRatio(ratio) {
-  if (ratio < 0.55) return 1
-  if (ratio < 0.75) return 2
-  if (ratio < 0.90) return 3
-  if (ratio < 1.05) return 4
-  if (ratio < 1.20) return 5
-  return 6
+  for (const z of _ZONES_ORDERED) {
+    if (ratio <= z.ftpMax) return z.id
+  }
+  return _ZONES_ORDERED[_ZONES_ORDERED.length - 1].id // Z6 fallback
 }
 
 // ─── Tick principal ──────────────────────────────────────────────────────────
@@ -185,6 +202,12 @@ export function simulateTick(rider, route, dtSec = 1) {
   // Puissance cible selon mode et état
   let powerWatts = mode.ftpFactor * energy.ftpWatts * energy.dayFormMod
   if (energy.exploded) powerWatts = energy.ftpWatts * 0.55
+
+  // Défaillance W' (crampe) : puissance bridée pendant N ticks, puis récupération
+  if (energy.wFailTicks > 0) {
+    powerWatts = Math.min(powerWatts, energy.ftpWatts * W_FAIL_POWER_FACTOR)
+    energy.wFailTicks = Math.max(0, energy.wFailTicks - dtSec)
+  }
 
   // Gradient actuel
   const gradient = route.getGradientAt ? route.getGradientAt(rider.splinePos) : 0

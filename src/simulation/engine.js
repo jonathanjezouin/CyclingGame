@@ -19,6 +19,17 @@ const W_FAIL_DURATION_TICKS = 10
 // Puissance bridée pendant la défaillance W' (fraction du FTP)
 const W_FAIL_POWER_FACTOR = 0.50
 
+// ─── Aspiration / draft (Bloc A — TDD v0.5 §4bis.3) ─────────────────────────
+// Courbe plafonnée : le bénéfice augmente avec le nombre d'écrans devant, avec
+// un rendement marginal décroissant, et plafonne à 7 écrans (au-delà, gain nul).
+// Index = nombre d'écrans dans le cône frontal ; valeur = réduction aéro de base.
+const DRAFT_BASE_TABLE = [0, 0.12, 0.22, 0.30, 0.36, 0.40, 0.43, 0.45]
+const DRAFT_CONE_DIST_M    = 10            // portée frontale du cône (m)
+const DRAFT_CONE_HALF_ANGLE = Math.PI / 6  // demi-angle 30°
+// Au-delà de cet écart longitudinal entre deux coureurs successifs (m), on
+// considère une cassure : ils ne sont plus dans le même groupe.
+const GROUP_GAP_THRESHOLD_M = 25
+
 // ─── Zones d'effort ─────────────────────────────────────────────────────────
 export const ZONES = {
   Z1: { id: 1, name: 'Récupération', ftpMin: 0,   ftpMax: 0.55, color: '#60a5fa', label: 'Z1' },
@@ -68,6 +79,7 @@ export function createRider(overrides = {}) {
     speedKmh: 0,
     effortMode: 'maintien',
     distanceTravelled: 0,
+    screenCount: 0,        // écrans devant dans le cône (Bloc A) — calculé par la boucle
     ...overrides,
   }
 }
@@ -96,14 +108,69 @@ export function createAIRider(overrides = {}) {
   })
 }
 
+/**
+ * Instancie N coureurs depuis un roster JSON (TDD v0.5 §7.3, Bloc A).
+ * Chaque entrée : { id, name, isPlayer, ftpWatts, role, aiProfile }.
+ *
+ * Les coureurs sont étagés longitudinalement à la ligne de départ pour qu'un
+ * peloton existe dès le premier tick (sinon tous à splinePos 0 = côte à côte,
+ * aucun écran, aucun draft). L'étagement est faible (quelques mètres) et sera
+ * vite réorganisé par la dynamique de course.
+ *
+ * @param {Object} roster - { id, riders: [...] }
+ * @param {Object} opts   - { startSpacingM: espacement initial entre coureurs }
+ * @returns {Array} riders
+ */
+export function createRidersFromRoster(roster, opts = {}) {
+  const startSpacingM = opts.startSpacingM ?? 3
+  const list = roster?.riders ?? []
+  const n = list.length
+
+  return list.map((entry, i) => {
+    const isPlayer = !!entry.isPlayer
+    // Étagement : le premier de la liste démarre devant. Léger zig-zag latéral
+    // pour éviter l'alignement parfait (et donner des écrans dans le cône).
+    const splinePos = (n - 1 - i) * startSpacingM
+    const lateralOffset = (i % 2 === 0 ? 1 : -1) * 0.4 * (isPlayer ? 1 : 1)
+
+    const make = isPlayer ? createRider : createAIRider
+    return make({
+      id:   entry.id   ?? `rider_${String(i).padStart(3, '0')}`,
+      name: entry.name ?? `Coureur ${i + 1}`,
+      isPlayer,
+      role: entry.role ?? 'allrounder',
+      aiProfile: isPlayer ? null : (entry.aiProfile ?? 'rouleur'),
+      splinePos,
+      renderPos: splinePos,
+      lateralOffset,
+      energy: {
+        endurance:  { current: 3600, max: 3600 },
+        wPrime:     { current: 25000, max: 25000 },
+        zone:       2,
+        ftpWatts:   entry.ftpWatts ?? 280,
+        exploded:   false,
+        wFailTicks: 0,
+        dayFormMod: 1.0,
+      },
+      effortMode: isPlayer ? 'maintien' : 'eco',
+    })
+  })
+}
+
 // ─── Calcul de vitesse (physique simplifiée) ─────────────────────────────────
 /**
  * Résolution numérique de v tel que P_dispo = P_aero(v) + P_pente(v) + P_roulement(v)
  * Dichotomie simple, 8 itérations.
+ *
+ * @param {number} powerWatts
+ * @param {number} gradientPercent
+ * @param {number} windKmh
+ * @param {number} draftFactor - multiplicateur de CdA ∈ ]0,1] (1 = pas d'abri).
+ *                               Vaut 1 - draftReduction(). Réduit la traînée aéro.
  */
-export function computeSpeed(powerWatts, gradientPercent, windKmh = 0) {
+export function computeSpeed(powerWatts, gradientPercent, windKmh = 0, draftFactor = 1) {
   const { rho, g, Crr, mass } = PHYSICS
-  const CdA = Math.abs(gradientPercent) > 3 ? PHYSICS.CdA_climb : PHYSICS.CdA_flat
+  const CdA = (Math.abs(gradientPercent) > 3 ? PHYSICS.CdA_climb : PHYSICS.CdA_flat) * draftFactor
   const gradient = gradientPercent / 100
   const vWind = windKmh / 3.6
 
@@ -125,6 +192,99 @@ export function computeSpeed(powerWatts, gradientPercent, windKmh = 0) {
   }
   const vMs = (lo + hi) / 2
   return Math.max(0, vMs * 3.6) // retourne en km/h
+}
+
+// ─── Aspiration / draft ──────────────────────────────────────────────────────
+/**
+ * Réduction aérodynamique due au draft.
+ * Modèle frontal plafonné (TDD v0.5 §4bis.3) :
+ *   draftEffectif = draftBase(screenCount) × clamp((v/40)², 0.05, 1.0)
+ * Le facteur vitesse modélise l'effondrement de l'aspiration en montagne
+ * (l'aéro est en v², donc à 15 km/h le draft est quasi nul).
+ *
+ * @param {number} screenCount - nombre de coureurs faisant écran dans le cône
+ * @param {number} speedKmh    - vitesse instantanée du coureur
+ * @returns {number} réduction ∈ [0, 0.45] — fraction de CdA économisée
+ */
+export function draftReduction(screenCount, speedKmh) {
+  const idx  = Math.min(Math.max(0, Math.floor(screenCount)), DRAFT_BASE_TABLE.length - 1)
+  const base = DRAFT_BASE_TABLE[idx]
+  const vFactor = Math.min(1.0, Math.max(0.05, (speedKmh / 40) ** 2))
+  return base * vFactor
+}
+
+/**
+ * Compte les coureurs faisant écran devant `rider`, dans son cône frontal.
+ * Géométrie (TDD v0.5 §12.1) : un coureur compte comme écran si
+ *   - il appartient au même groupe,
+ *   - il est devant en splinePos (ahead > 0),
+ *   - il est dans la fenêtre de distance (ahead ≤ CONE_DIST),
+ *   - son écart latéral le place dans le demi-angle du cône.
+ *
+ * On compte sur la géométrie, pas sur rankInGroup : deux coureurs côte à côte
+ * (même splinePos) ne s'abritent pas, et un coureur en 2e ligne ne « voit »
+ * que les coureurs réellement devant lui.
+ *
+ * @param {Object} rider
+ * @param {Array}  riders - tous les coureurs
+ * @returns {number} nombre d'écrans
+ */
+export function computeScreenCount(rider, riders) {
+  let count = 0
+  for (const r of riders) {
+    if (r.id === rider.id || r.group !== rider.group) continue
+    const ahead = r.splinePos - rider.splinePos
+    if (ahead <= 0 || ahead > DRAFT_CONE_DIST_M) continue
+    const lateral = Math.abs((r.lateralOffset ?? 0) - (rider.lateralOffset ?? 0))
+    const angle = Math.atan2(lateral, ahead)
+    if (angle <= DRAFT_CONE_HALF_ANGLE) count++
+  }
+  return count
+}
+
+/**
+ * Recalcule group + rankInGroup pour tous les coureurs (TDD v0.5 §12.1).
+ * Étagement longitudinal : tri par splinePos décroissant (1 = tête de course),
+ * segmentation en groupes selon les écarts (> GROUP_GAP_THRESHOLD_M => cassure).
+ *
+ * Mute chaque rider (group, rankInGroup). Retourne la liste des groupes
+ * pour l'UI (bandeau d'écarts) : [{ name, riders: [...] }, ...].
+ *
+ * @param {Array} riders
+ * @returns {Array} groupes ordonnés de l'avant vers l'arrière
+ */
+export function updateGroups(riders) {
+  if (riders.length === 0) return []
+  const sorted = [...riders].sort((a, b) => b.splinePos - a.splinePos)
+
+  const groups = []
+  let current = null
+  let prevPos = null
+
+  for (const r of sorted) {
+    if (current === null || (prevPos - r.splinePos) > GROUP_GAP_THRESHOLD_M) {
+      current = { name: `group_${groups.length}`, riders: [] }
+      groups.push(current)
+    }
+    current.riders.push(r)
+    prevPos = r.splinePos
+  }
+
+  // Nommage lisible : tête = échappée si seule devant, sinon peloton ; reste = poursuivants/retardataires
+  groups.forEach((g, gi) => {
+    let name
+    if (groups.length === 1)      name = 'peloton'
+    else if (gi === 0)            name = g.riders.length <= 3 ? 'echappee' : 'peloton'
+    else if (gi === groups.length - 1) name = 'retardataires'
+    else                          name = 'poursuivants'
+    g.name = name
+    g.riders.forEach((r, ri) => {
+      r.group = name
+      r.rankInGroup = ri + 1   // 1 = tête de groupe
+    })
+  })
+
+  return groups
 }
 
 // ─── Consommation d'énergie ──────────────────────────────────────────────────
@@ -212,8 +372,14 @@ export function simulateTick(rider, route, dtSec = 1) {
   // Gradient actuel
   const gradient = route.getGradientAt ? route.getGradientAt(rider.splinePos) : 0
 
+  // Aspiration : la réduction de traînée dépend du nombre d'écrans devant
+  // (rider.screenCount, calculé par la boucle avant le tick) et de la vitesse
+  // du tick précédent (facteur v² qui varie peu d'un tick à l'autre).
+  const draft = draftReduction(rider.screenCount ?? 0, rider.speedKmh)
+  const draftFactor = 1 - draft
+
   // Vitesse
-  const speedKmh = computeSpeed(powerWatts, gradient)
+  const speedKmh = computeSpeed(powerWatts, gradient, 0, draftFactor)
   rider.speedKmh = speedKmh
 
   // Avancement sur la spline (m)

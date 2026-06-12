@@ -9,6 +9,10 @@
 import * as PIXI from 'pixi.js'
 import { riderToPixel, SCALE } from './spline.js'
 
+// Géométrie du cône d'aspiration (doit rester cohérente avec engine.js §4bis.3)
+const CONE_DIST_M     = 10           // portée frontale (m)
+const CONE_HALF_ANGLE = Math.PI / 6  // demi-angle 30°
+
 const ROAD_WIDTH_M  = 7                   // largeur uniforme en mètres
 const ROAD_WIDTH_PX = ROAD_WIDTH_M * SCALE // 70px à zoom 1.0
 
@@ -29,13 +33,17 @@ export class GameRenderer {
 
     this.world          = new PIXI.Container()
     this.roadContainer  = new PIXI.Container()
+    this.coneContainer  = new PIXI.Container()   // overlay cônes d'aspiration (debug)
     this.riderContainer = new PIXI.Container()
     this.world.addChild(this.roadContainer)
+    this.world.addChild(this.coneContainer)      // sous les riders, au-dessus de la route
     this.world.addChild(this.riderContainer)
     this.app.stage.addChild(this.world)
 
     this._zoom    = 1.0
     this._sprites = new Map()   // riderId → PIXI.Graphics
+    this._cones   = new Map()   // riderId → { gfx, label }
+    this._showCones = false     // toggle debug (touche 'C')
 
     this._setupZoom(canvasEl)
   }
@@ -164,12 +172,41 @@ export class GameRenderer {
    */
   initRiders(riders) {
     this.riderContainer.removeChildren()
+    this.coneContainer.removeChildren()
     this._sprites.clear()
+    this._cones.clear()
     for (const rider of riders) {
+      // Cône d'abri (dessiné sous le sprite, blend additif pour cumuler
+      // les superpositions de plusieurs coureurs — voir _drawCone)
+      const cone = new PIXI.Graphics()
+      cone.blendMode = PIXI.BLEND_MODES.ADD
+      const label = new PIXI.Text('', { fontSize: 9, fill: 0xffffff, align: 'center' })
+      label.anchor.set(0.5)
+      label.visible = false
+      this.coneContainer.addChild(cone)
+      this.coneContainer.addChild(label)
+      this._cones.set(rider.id, { cone, label })
+
       const gfx = new PIXI.Graphics()
       this.riderContainer.addChild(gfx)
       this._sprites.set(rider.id, { gfx, prevX: 0, prevY: 0 })
     }
+  }
+
+  /**
+   * Active/désactive l'overlay des cônes d'aspiration (debug Zoom 3).
+   * @param {boolean} [force] - état forcé ; sinon bascule.
+   * @returns {boolean} nouvel état
+   */
+  toggleCones(force) {
+    this._showCones = (force === undefined) ? !this._showCones : !!force
+    if (!this._showCones) {
+      for (const { cone, label } of this._cones.values()) {
+        cone.clear()
+        label.visible = false
+      }
+    }
+    return this._showCones
   }
 
   /**
@@ -198,6 +235,9 @@ export class GameRenderer {
       entry.gfx.rotation = px.rotation + Math.PI / 2
 
       this._drawRiderShape(entry.gfx, rider)
+
+      // Cône d'aspiration (debug)
+      if (this._showCones) this._drawCone(rider, px)
 
       if (rider.id === playerRiderId) playerPx = px
     }
@@ -240,6 +280,58 @@ export class GameRenderer {
     // Outline zone
     gfx.lineStyle(0.8, zoneColor, 0.7)
     gfx.drawEllipse(0, 0, hw, hl)
+  }
+
+  /**
+   * Dessine le cône d'abri projeté par un coureur (overlay debug, TDD §3.6,
+   * orienté v0.5bis).
+   *
+   * Lecture v0.5bis : le cône n'est plus « où je cherche un abri » mais
+   * « la zone que je protège ». Il s'étend vers l'ARRIÈRE du coureur
+   * (direction opposée à son cap), même géométrie que computeScreenCount
+   * (portée 10m, demi-angle 30°) — c'est la même relation A/B vue de l'autre
+   * bout, donc aucun changement dans engine.js.
+   *
+   * Tous les cônes sont dessinés à opacité faible et constante, en blend
+   * additif (PIXI.BLEND_MODES.ADD) : là où plusieurs cônes se superposent
+   * (un coureur profondément abrité dans le peloton), la zone s'éclaircit
+   * naturellement. La densité de superposition *est* la visualisation —
+   * pas besoin d'un cône géant pour « contenir » 7 coureurs.
+   *
+   * Un label numérique (screenCount du coureur) reste affiché pour la
+   * précision — le cône est une abstraction lisible, le chiffre est exact.
+   *
+   * @param {Object} rider - doit porter rider.screenCount
+   * @param {{x,y,rotation}} px - position pixel et orientation du coureur
+   */
+  _drawCone(rider, px) {
+    const entry = this._cones.get(rider.id)
+    if (!entry) return
+    const { cone, label } = entry
+
+    const dist = CONE_DIST_M * SCALE
+    // Le cône d'abri s'étend vers l'arrière : direction opposée au cap.
+    const backHeading = px.rotation + Math.PI
+    const aLeft  = backHeading - CONE_HALF_ANGLE
+    const aRight = backHeading + CONE_HALF_ANGLE
+
+    cone.clear()
+    cone.beginFill(0x34d399, 0.07)
+    cone.moveTo(px.x, px.y)
+    const ARC_STEPS = 8
+    for (let i = 0; i <= ARC_STEPS; i++) {
+      const a = aLeft + (aRight - aLeft) * (i / ARC_STEPS)
+      cone.lineTo(px.x + Math.cos(a) * dist, px.y + Math.sin(a) * dist)
+    }
+    cone.lineTo(px.x, px.y)
+    cone.endFill()
+
+    // Label : nombre d'écrans captés par CE coureur (debug, exact)
+    const sc = rider.screenCount ?? 0
+    label.visible = sc > 0
+    label.text = sc > 0 ? `${sc}` : ''
+    label.x = px.x
+    label.y = px.y - 14
   }
 
   // ─── Caméra ────────────────────────────────────────────────────────────────

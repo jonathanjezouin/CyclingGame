@@ -31,8 +31,8 @@
         <div class="game-subtitle">POC — v0.1</div>
         <div class="track-info" v-if="track">
           <div class="track-name">{{ track.name }}</div>
-          <div class="track-meta">{{ track.distance_km }} km · {{ track.type }}</div>
-          <div class="track-hint">Molette : zoom · Espace : pause</div>
+          <div class="track-meta">{{ track.distance_km }} km · {{ track.type }} · {{ riders.length }} coureurs</div>
+          <div class="track-hint">Molette : zoom · Espace : pause · C : cônes d'aspiration</div>
         </div>
         <button class="start-btn" @click="startRace">Démarrer la course</button>
       </div>
@@ -76,11 +76,12 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import HUD from './ui/HUD.vue'
 import AltimetricProfile from './ui/AltimetricProfile.vue'
-import { createRider, createAIRider } from './simulation/engine.js'
+import { createRider, createAIRider, createRidersFromRoster } from './simulation/engine.js'
 import { SimulationLoop } from './simulation/loop.js'
 import { CatmullRomSpline } from './render/spline.js'
 import { GameRenderer } from './render/renderer.js'
 import trackData from './data/track_poc.json'
+import rosterData from './data/roster_poc.json'
 
 // ─── État ────────────────────────────────────────────────────────────────────
 const canvasEl       = ref(null)
@@ -94,11 +95,9 @@ const splineInstance = ref(null)
 const track    = ref(trackData)
 const altWidth = computed(() => Math.min(600, window.innerWidth - 40))
 
-// Coureurs — tableau réactif
-const riders = ref([
-  createRider(),
-  createAIRider(),
-])
+// Coureurs — tableau réactif, chargés depuis le roster (Bloc A)
+const riders = ref(createRidersFromRoster(rosterData))
+const conesOn = ref(false)
 
 const playerRider = computed(() => riders.value.find(r => r.isPlayer))
 
@@ -140,6 +139,10 @@ function onKeyDown(e) {
   if (e.code === 'Space' && gameState.value === 'racing') {
     e.preventDefault()
     togglePause()
+  }
+  // Bloc A : toggle debug des cônes d'aspiration
+  if (e.code === 'KeyC') {
+    conesOn.value = renderer ? renderer.toggleCones() : false
   }
 }
 
@@ -238,7 +241,7 @@ function resetRace() {
   paused.value        = false
   elapsedSimSec.value = 0
 
-  riders.value = [ createRider(), createAIRider() ]
+  riders.value = createRidersFromRoster(rosterData)
   renderer.initRiders(riders.value.map(r => ({ id: r.id, isPlayer: r.isPlayer })))
   gameState.value = 'start'
 }

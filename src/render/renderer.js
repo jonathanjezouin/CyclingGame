@@ -9,6 +9,12 @@
 import * as PIXI from 'pixi.js'
 import { riderToPixel, SCALE } from './spline.js'
 
+// Géométrie du cône d'aspiration (doit rester cohérente avec engine.js §4bis.3)
+const CONE_DIST_M     = 10           // portée frontale (m)
+const CONE_HALF_ANGLE = Math.PI / 6  // demi-angle 30°
+// Réduction de base par nombre d'écrans, pour afficher le % de draft dans le cône
+const DRAFT_BASE_TABLE = [0, 0.12, 0.22, 0.30, 0.36, 0.40, 0.43, 0.45]
+
 const ROAD_WIDTH_M  = 7                   // largeur uniforme en mètres
 const ROAD_WIDTH_PX = ROAD_WIDTH_M * SCALE // 70px à zoom 1.0
 
@@ -29,13 +35,17 @@ export class GameRenderer {
 
     this.world          = new PIXI.Container()
     this.roadContainer  = new PIXI.Container()
+    this.coneContainer  = new PIXI.Container()   // overlay cônes d'aspiration (debug)
     this.riderContainer = new PIXI.Container()
     this.world.addChild(this.roadContainer)
+    this.world.addChild(this.coneContainer)      // sous les riders, au-dessus de la route
     this.world.addChild(this.riderContainer)
     this.app.stage.addChild(this.world)
 
     this._zoom    = 1.0
     this._sprites = new Map()   // riderId → PIXI.Graphics
+    this._cones   = new Map()   // riderId → { gfx, label }
+    this._showCones = false     // toggle debug (touche 'C')
 
     this._setupZoom(canvasEl)
   }
@@ -164,12 +174,39 @@ export class GameRenderer {
    */
   initRiders(riders) {
     this.riderContainer.removeChildren()
+    this.coneContainer.removeChildren()
     this._sprites.clear()
+    this._cones.clear()
     for (const rider of riders) {
+      // Cône d'aspiration (dessiné sous le sprite)
+      const cone = new PIXI.Graphics()
+      const label = new PIXI.Text('', { fontSize: 9, fill: 0xffffff, align: 'center' })
+      label.anchor.set(0.5)
+      label.visible = false
+      this.coneContainer.addChild(cone)
+      this.coneContainer.addChild(label)
+      this._cones.set(rider.id, { cone, label })
+
       const gfx = new PIXI.Graphics()
       this.riderContainer.addChild(gfx)
       this._sprites.set(rider.id, { gfx, prevX: 0, prevY: 0 })
     }
+  }
+
+  /**
+   * Active/désactive l'overlay des cônes d'aspiration (debug Zoom 3).
+   * @param {boolean} [force] - état forcé ; sinon bascule.
+   * @returns {boolean} nouvel état
+   */
+  toggleCones(force) {
+    this._showCones = (force === undefined) ? !this._showCones : !!force
+    if (!this._showCones) {
+      for (const { cone, label } of this._cones.values()) {
+        cone.clear()
+        label.visible = false
+      }
+    }
+    return this._showCones
   }
 
   /**
@@ -198,6 +235,9 @@ export class GameRenderer {
       entry.gfx.rotation = px.rotation + Math.PI / 2
 
       this._drawRiderShape(entry.gfx, rider)
+
+      // Cône d'aspiration (debug)
+      if (this._showCones) this._drawCone(rider, px)
 
       if (rider.id === playerRiderId) playerPx = px
     }
@@ -240,6 +280,54 @@ export class GameRenderer {
     // Outline zone
     gfx.lineStyle(0.8, zoneColor, 0.7)
     gfx.drawEllipse(0, 0, hw, hl)
+  }
+
+  /**
+   * Dessine le cône d'aspiration devant un coureur (overlay debug, TDD §3.6).
+   * Le cône pointe vers l'avant (tangente), demi-angle 30°, portée ~10m.
+   * Sa couleur/opacité « s'allume » selon le screenCount ; le % de draft de
+   * base est affiché au centre.
+   * @param {Object} rider - doit porter rider.screenCount
+   * @param {{x,y,rotation}} px - position pixel et orientation du coureur
+   */
+  _drawCone(rider, px) {
+    const entry = this._cones.get(rider.id)
+    if (!entry) return
+    const { cone, label } = entry
+
+    const sc       = rider.screenCount ?? 0
+    const idx      = Math.min(Math.max(0, Math.floor(sc)), DRAFT_BASE_TABLE.length - 1)
+    const baseDraft = DRAFT_BASE_TABLE[idx]
+
+    const dist  = CONE_DIST_M * SCALE
+    const heading = px.rotation               // direction de course (radians)
+    const aLeft   = heading - CONE_HALF_ANGLE
+    const aRight  = heading + CONE_HALF_ANGLE
+
+    // Intensité : 0 écran → vert très pâle ; plafond → vert vif
+    const t       = Math.min(1, sc / 7)
+    const opacity = 0.06 + 0.22 * t
+    const color   = sc > 0 ? 0x34d399 : 0x9ca3af
+
+    cone.clear()
+    cone.beginFill(color, opacity)
+    cone.lineStyle(1, color, 0.4 + 0.4 * t)
+    cone.moveTo(px.x, px.y)
+    cone.lineTo(px.x + Math.cos(aLeft) * dist,  px.y + Math.sin(aLeft) * dist)
+    // arc frontal
+    const ARC_STEPS = 8
+    for (let i = 0; i <= ARC_STEPS; i++) {
+      const a = aLeft + (aRight - aLeft) * (i / ARC_STEPS)
+      cone.lineTo(px.x + Math.cos(a) * dist, px.y + Math.sin(a) * dist)
+    }
+    cone.lineTo(px.x, px.y)
+    cone.endFill()
+
+    // Label : % de draft de base (sans facteur vitesse, pour la lisibilité géométrique)
+    label.visible = true
+    label.text = sc > 0 ? `${Math.round(baseDraft * 100)}% · ${sc}` : ''
+    label.x = px.x + Math.cos(heading) * dist * 0.55
+    label.y = px.y + Math.sin(heading) * dist * 0.55
   }
 
   // ─── Caméra ────────────────────────────────────────────────────────────────

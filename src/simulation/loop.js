@@ -6,7 +6,7 @@
  *   rider.renderPos = position interpolée à afficher (mis à jour à 60 FPS)
  *   rider.splinePos = position simulée (mis à jour par ticks discrets)
  */
-import { simulateTick } from './engine.js'
+import { simulateTick, updateGroups, computeScreenCount } from './engine.js'
 
 export class SimulationLoop {
   /**
@@ -33,6 +33,7 @@ export class SimulationLoop {
       r.renderPos = 0
       this._interp[r.id] = { before: 0, after: 0 }
     }
+    this.groups = []
   }
 
   start() {
@@ -75,6 +76,14 @@ export class SimulationLoop {
         // Traite les ticks (max 120 par frame)
         let ticks = 0
         while (this._accumulator >= 1 && ticks < 120) {
+          // Bloc A : recalcul des groupes (étagement longitudinal) puis du
+          // nombre d'écrans dans le cône frontal de chaque coureur. Fait avant
+          // les ticks pour que le draft de ce tick reflète la position courante.
+          this.groups = updateGroups(this.riders)
+          for (const rider of this.riders) {
+            rider.screenCount = computeScreenCount(rider, this.riders)
+          }
+
           for (const rider of this.riders) {
             this._interp[rider.id].before = rider.splinePos
             simulateTick(rider, this.route, 1)
@@ -93,7 +102,7 @@ export class SimulationLoop {
         }
 
         if (ticks > 0) {
-          this.onTick({ riders: this.riders, elapsedSimSec: this.elapsedSimSec })
+          this.onTick({ riders: this.riders, groups: this.groups, elapsedSimSec: this.elapsedSimSec })
         }
 
         // Fin de course (quand le joueur arrive)

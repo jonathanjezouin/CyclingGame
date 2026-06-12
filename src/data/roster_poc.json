@@ -1,0 +1,26 @@
+{
+  "id": "roster_poc_p1",
+  "name": "Peloton POC — Phase 1 Bloc A",
+  "riders": [
+    { "id": "rider_001", "name": "Marco Deluca",    "isPlayer": true,  "ftpWatts": 280, "role": "climber",    "aiProfile": null },
+    { "id": "rider_002", "name": "Lucas Ferrer",     "isPlayer": false, "ftpWatts": 300, "role": "rouleur",    "aiProfile": "rouleur" },
+    { "id": "rider_003", "name": "Tom Bauer",        "isPlayer": false, "ftpWatts": 295, "role": "rouleur",    "aiProfile": "rouleur" },
+    { "id": "rider_004", "name": "Diego Marín",      "isPlayer": false, "ftpWatts": 285, "role": "climber",    "aiProfile": "grimpeur" },
+    { "id": "rider_005", "name": "Nils Andersen",    "isPlayer": false, "ftpWatts": 275, "role": "sprinter",   "aiProfile": "sprinteur" },
+    { "id": "rider_006", "name": "Yannick Lefort",   "isPlayer": false, "ftpWatts": 290, "role": "allrounder", "aiProfile": "rouleur" },
+    { "id": "rider_007", "name": "Paolo Greco",      "isPlayer": false, "ftpWatts": 282, "role": "climber",    "aiProfile": "grimpeur" },
+    { "id": "rider_008", "name": "Sven Holm",        "isPlayer": false, "ftpWatts": 305, "role": "rouleur",    "aiProfile": "rouleur" },
+    { "id": "rider_009", "name": "Hugo Mertens",     "isPlayer": false, "ftpWatts": 270, "role": "sprinter",   "aiProfile": "sprinteur" },
+    { "id": "rider_010", "name": "Rafael Costa",     "isPlayer": false, "ftpWatts": 288, "role": "climber",    "aiProfile": "grimpeur" },
+    { "id": "rider_011", "name": "Erik Vasquez",     "isPlayer": false, "ftpWatts": 278, "role": "allrounder", "aiProfile": "rouleur" },
+    { "id": "rider_012", "name": "Mathis Roy",       "isPlayer": false, "ftpWatts": 292, "role": "rouleur",    "aiProfile": "rouleur" },
+    { "id": "rider_013", "name": "Karl Brenner",     "isPlayer": false, "ftpWatts": 268, "role": "sprinter",   "aiProfile": "sprinteur" },
+    { "id": "rider_014", "name": "Leon Fischer",     "isPlayer": false, "ftpWatts": 284, "role": "climber",    "aiProfile": "grimpeur" },
+    { "id": "rider_015", "name": "Adrien Noël",      "isPlayer": false, "ftpWatts": 296, "role": "rouleur",    "aiProfile": "rouleur" },
+    { "id": "rider_016", "name": "Bruno Sala",       "isPlayer": false, "ftpWatts": 281, "role": "allrounder", "aiProfile": "rouleur" },
+    { "id": "rider_017", "name": "Théo Garnier",     "isPlayer": false, "ftpWatts": 287, "role": "climber",    "aiProfile": "grimpeur" },
+    { "id": "rider_018", "name": "Iván Soto",        "isPlayer": false, "ftpWatts": 273, "role": "sprinter",   "aiProfile": "sprinteur" },
+    { "id": "rider_019", "name": "Felix Wagner",     "isPlayer": false, "ftpWatts": 298, "role": "rouleur",    "aiProfile": "rouleur" },
+    { "id": "rider_020", "name": "Owen Walsh",       "isPlayer": false, "ftpWatts": 279, "role": "allrounder", "aiProfile": "rouleur" }
+  ]
+}

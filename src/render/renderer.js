@@ -12,8 +12,6 @@ import { riderToPixel, SCALE } from './spline.js'
 // Géométrie du cône d'aspiration (doit rester cohérente avec engine.js §4bis.3)
 const CONE_DIST_M     = 10           // portée frontale (m)
 const CONE_HALF_ANGLE = Math.PI / 6  // demi-angle 30°
-// Réduction de base par nombre d'écrans, pour afficher le % de draft dans le cône
-const DRAFT_BASE_TABLE = [0, 0.12, 0.22, 0.30, 0.36, 0.40, 0.43, 0.45]
 
 const ROAD_WIDTH_M  = 7                   // largeur uniforme en mètres
 const ROAD_WIDTH_PX = ROAD_WIDTH_M * SCALE // 70px à zoom 1.0
@@ -178,8 +176,10 @@ export class GameRenderer {
     this._sprites.clear()
     this._cones.clear()
     for (const rider of riders) {
-      // Cône d'aspiration (dessiné sous le sprite)
+      // Cône d'abri (dessiné sous le sprite, blend additif pour cumuler
+      // les superpositions de plusieurs coureurs — voir _drawCone)
       const cone = new PIXI.Graphics()
+      cone.blendMode = PIXI.BLEND_MODES.ADD
       const label = new PIXI.Text('', { fontSize: 9, fill: 0xffffff, align: 'center' })
       label.anchor.set(0.5)
       label.visible = false
@@ -283,10 +283,24 @@ export class GameRenderer {
   }
 
   /**
-   * Dessine le cône d'aspiration devant un coureur (overlay debug, TDD §3.6).
-   * Le cône pointe vers l'avant (tangente), demi-angle 30°, portée ~10m.
-   * Sa couleur/opacité « s'allume » selon le screenCount ; le % de draft de
-   * base est affiché au centre.
+   * Dessine le cône d'abri projeté par un coureur (overlay debug, TDD §3.6,
+   * orienté v0.5bis).
+   *
+   * Lecture v0.5bis : le cône n'est plus « où je cherche un abri » mais
+   * « la zone que je protège ». Il s'étend vers l'ARRIÈRE du coureur
+   * (direction opposée à son cap), même géométrie que computeScreenCount
+   * (portée 10m, demi-angle 30°) — c'est la même relation A/B vue de l'autre
+   * bout, donc aucun changement dans engine.js.
+   *
+   * Tous les cônes sont dessinés à opacité faible et constante, en blend
+   * additif (PIXI.BLEND_MODES.ADD) : là où plusieurs cônes se superposent
+   * (un coureur profondément abrité dans le peloton), la zone s'éclaircit
+   * naturellement. La densité de superposition *est* la visualisation —
+   * pas besoin d'un cône géant pour « contenir » 7 coureurs.
+   *
+   * Un label numérique (screenCount du coureur) reste affiché pour la
+   * précision — le cône est une abstraction lisible, le chiffre est exact.
+   *
    * @param {Object} rider - doit porter rider.screenCount
    * @param {{x,y,rotation}} px - position pixel et orientation du coureur
    */
@@ -295,26 +309,15 @@ export class GameRenderer {
     if (!entry) return
     const { cone, label } = entry
 
-    const sc       = rider.screenCount ?? 0
-    const idx      = Math.min(Math.max(0, Math.floor(sc)), DRAFT_BASE_TABLE.length - 1)
-    const baseDraft = DRAFT_BASE_TABLE[idx]
-
-    const dist  = CONE_DIST_M * SCALE
-    const heading = px.rotation               // direction de course (radians)
-    const aLeft   = heading - CONE_HALF_ANGLE
-    const aRight  = heading + CONE_HALF_ANGLE
-
-    // Intensité : 0 écran → vert très pâle ; plafond → vert vif
-    const t       = Math.min(1, sc / 7)
-    const opacity = 0.06 + 0.22 * t
-    const color   = sc > 0 ? 0x34d399 : 0x9ca3af
+    const dist = CONE_DIST_M * SCALE
+    // Le cône d'abri s'étend vers l'arrière : direction opposée au cap.
+    const backHeading = px.rotation + Math.PI
+    const aLeft  = backHeading - CONE_HALF_ANGLE
+    const aRight = backHeading + CONE_HALF_ANGLE
 
     cone.clear()
-    cone.beginFill(color, opacity)
-    cone.lineStyle(1, color, 0.4 + 0.4 * t)
+    cone.beginFill(0x34d399, 0.07)
     cone.moveTo(px.x, px.y)
-    cone.lineTo(px.x + Math.cos(aLeft) * dist,  px.y + Math.sin(aLeft) * dist)
-    // arc frontal
     const ARC_STEPS = 8
     for (let i = 0; i <= ARC_STEPS; i++) {
       const a = aLeft + (aRight - aLeft) * (i / ARC_STEPS)
@@ -323,11 +326,12 @@ export class GameRenderer {
     cone.lineTo(px.x, px.y)
     cone.endFill()
 
-    // Label : % de draft de base (sans facteur vitesse, pour la lisibilité géométrique)
-    label.visible = true
-    label.text = sc > 0 ? `${Math.round(baseDraft * 100)}% · ${sc}` : ''
-    label.x = px.x + Math.cos(heading) * dist * 0.55
-    label.y = px.y + Math.sin(heading) * dist * 0.55
+    // Label : nombre d'écrans captés par CE coureur (debug, exact)
+    const sc = rider.screenCount ?? 0
+    label.visible = sc > 0
+    label.text = sc > 0 ? `${sc}` : ''
+    label.x = px.x
+    label.y = px.y - 14
   }
 
   // ─── Caméra ────────────────────────────────────────────────────────────────

@@ -155,6 +155,13 @@ function startRace() {
   const routeAdapter = {
     totalLength:   spline.totalLength,
     getGradientAt: (pos) => spline.getGradientAt(pos),
+    // IA0 (PBI v1.1) — dérivation route : segments (m, déjà dans cette unité
+    // dans le JSON) et keyPoints (convertis de km vers splinePos en m).
+    segments:  track.value.segments ?? [],
+    keyPoints: (track.value.keyPoints ?? []).map(kp => ({
+      ...kp,
+      splinePos: spline.getSplinePosAtKm(kp.km),
+    })),
   }
 
   simLoop = new SimulationLoop({

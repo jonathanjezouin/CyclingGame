@@ -83,6 +83,32 @@ describe('CatmullRomSpline — getKmAt', () => {
   })
 })
 
+describe('CatmullRomSpline — getSplinePosAtKm (IA0, conversion keyPoints)', () => {
+  const s = new CatmullRomSpline(straightClimb)
+
+  it('km = 0 → splinePos = 0', () => {
+    expect(s.getSplinePosAtKm(0)).toBeCloseTo(0, 3)
+  })
+
+  it('km total → splinePos = totalLength', () => {
+    expect(s.getSplinePosAtKm(1.0)).toBeCloseTo(s.totalLength, 3)
+  })
+
+  it('km à mi-parcours (point de contrôle exact) → ≈ totalLength / 2', () => {
+    expect(s.getSplinePosAtKm(0.5)).toBeCloseTo(s.totalLength / 2, 3)
+  })
+
+  it('round-trip avec getKmAt', () => {
+    const pos = s.totalLength * 0.3
+    const km  = s.getKmAt(pos)
+    expect(s.getSplinePosAtKm(km)).toBeCloseTo(pos, 1)
+  })
+
+  it('monotone', () => {
+    expect(s.getSplinePosAtKm(0.75)).toBeGreaterThan(s.getSplinePosAtKm(0.25))
+  })
+})
+
 describe('riderToPixel — interface canonique TDD §5.3', () => {
   const s = new CatmullRomSpline(straightClimb)
 

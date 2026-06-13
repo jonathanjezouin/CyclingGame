@@ -117,6 +117,27 @@ export class CatmullRomSpline {
   }
 
   /**
+   * Position spline (m) pour un km donné — inverse de getKmAt.
+   * Utilisée pour convertir les keyPoints du JSON (déclarés en km) en
+   * splinePos (m), seule unité utilisée par le moteur de simulation
+   * (IA0 — PBI v1.1, dérivation route).
+   */
+  getSplinePosAtKm(km) {
+    const table = this._altTable
+    if (!table || table.length < 2) return 0
+    let i = table.length - 2
+    for (let j = 0; j < table.length - 1; j++) {
+      if (km <= table[j + 1].km) { i = j; break }
+    }
+    const a = table[i]
+    const b = table[i + 1]
+    const range = b.km - a.km
+    if (range <= 0) return a.splinePos
+    const t = (km - a.km) / range
+    return a.splinePos + (b.splinePos - a.splinePos) * t
+  }
+
+  /**
    * Km parcourus à une position spline donnée.
    */
   getKmAt(splinePos) {

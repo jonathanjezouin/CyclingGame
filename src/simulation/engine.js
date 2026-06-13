@@ -30,6 +30,47 @@ const DRAFT_CONE_HALF_ANGLE = Math.PI / 6  // demi-angle 30°
 // considère une cassure : ils ne sont plus dans le même groupe.
 const GROUP_GAP_THRESHOLD_M = 25
 
+// ─── IA comportementale (Bloc B — TDD/GDD v0.5 §12.2) ───────────────────────
+// États de la machine IA. EXPLODED et RECOVERING priment sur la décision de
+// profil ; ATTACKING se maintient jusqu'à quasi-épuisement du W' (hystérésis,
+// évite le flip-flop tick par tick).
+export const AI_STATES = {
+  FOLLOWING:  'following',
+  ATTACKING:  'attacking',
+  EXPLODED:   'exploded',
+  RECOVERING: 'recovering',
+}
+
+// Seuils de réserve W' (fraction du max) pour les transitions d'état.
+const WPRIME_RECOVER_ENTER = 0.15  // sous ce seuil → RECOVERING (Éco forcé)
+const WPRIME_RECOVER_EXIT  = 0.40  // au-dessus → sortie de RECOVERING
+const WPRIME_ATTACK_EXIT   = 0.15  // sous ce seuil → fin d'attaque (RECOVERING)
+
+// Profils IA — stratégie d'effort selon le terrain (TDD v0.5 §12.2).
+// equipier : "calque sur le leader d'équipe" nécessite un modèle d'équipe
+// (team_id / leader_id) non encore présent dans le schéma roster — en
+// attendant, comportement prudent type rouleur, sans initiative d'attaque
+// (seuil d'attaque "Jamais", conforme à la table v0.5).
+export const AI_PROFILES = {
+  grimpeur: {
+    climbGradientMin:  2,     // % — au-delà : terrain de montée pour ce profil
+    attackGradientMin: 5,     // % — gradient minimum pour tenter une attaque
+    attackWPrimeMin:   0.60,  // W' minimum pour tenter une attaque
+  },
+  rouleur: {
+    climbGradientMin:  2,
+    attackGradientMax: 2,     // attaque seulement sur plat / faux-plat
+    attackWPrimeMin:   0.70,
+  },
+  sprinteur: {
+    maintienDistM: 2000,      // bascule en Maintien dans les 2 derniers km
+    sprintDistM:   500,       // attaque (Z5/Z6) dans les 500 derniers m
+  },
+  equipier: {
+    climbGradientMin: 2,
+  },
+}
+
 // ─── Zones d'effort ─────────────────────────────────────────────────────────
 export const ZONES = {
   Z1: { id: 1, name: 'Récupération', ftpMin: 0,   ftpMax: 0.55, color: '#60a5fa', label: 'Z1' },
@@ -93,6 +134,7 @@ export function createAIRider(overrides = {}) {
     id: 'rider_ai_001',
     name: 'Lucas Ferrer',
     isPlayer: false,
+    aiState: AI_STATES.FOLLOWING,
     lateralOffset: -0.8,    // côté gauche de la route
     energy: {
       endurance:  { current: 3600, max: 3600 },
@@ -286,6 +328,123 @@ export function updateGroups(riders) {
 
   return groups
 }
+
+// ─── IA comportementale — décision d'effort (Bloc B) ────────────────────────
+/**
+ * Détermine si `rider` doit tenter une attaque selon son profil
+ * (TDD/GDD v0.5 §12.2 — colonne "Seuil d'attaque").
+ *
+ * @returns {boolean}
+ */
+export function shouldAttack(rider, gradient, distanceToFinish, wRatio) {
+  const profile = AI_PROFILES[rider.aiProfile]
+  if (!profile) return false
+  switch (rider.aiProfile) {
+    case 'grimpeur':
+      return gradient >= profile.attackGradientMin && wRatio >= profile.attackWPrimeMin
+    case 'rouleur':
+      return gradient <= profile.attackGradientMax && wRatio >= profile.attackWPrimeMin
+    case 'sprinteur':
+      return distanceToFinish <= profile.sprintDistM
+    case 'equipier':
+    default:
+      return false // "Seuil d'attaque : Jamais" (TDD v0.5 §12.2)
+  }
+}
+
+/**
+ * Mode d'effort « de croisière » (état FOLLOWING) selon profil et terrain
+ * (TDD/GDD v0.5 §12.2 — colonnes "Stratégie montée" / "descente-plat").
+ *
+ * @returns {'eco'|'maintien'}
+ */
+export function baseEffortMode(rider, gradient, distanceToFinish) {
+  const profile = AI_PROFILES[rider.aiProfile]
+  if (!profile) return 'maintien'
+  switch (rider.aiProfile) {
+    case 'grimpeur':
+      // Maintien en montée (son terrain), Éco ailleurs (garde les jambes pour le col)
+      return gradient >= profile.climbGradientMin ? 'maintien' : 'eco'
+    case 'rouleur':
+    case 'equipier':
+      // Éco en montagne (pas leur terrain), Maintien sur plat / faux-plat
+      return gradient >= profile.climbGradientMin ? 'eco' : 'maintien'
+    case 'sprinteur':
+      // Éco jusqu'aux 2 derniers km, puis Maintien pour se replacer avant le sprint
+      return distanceToFinish <= profile.maintienDistM ? 'maintien' : 'eco'
+    default:
+      return 'maintien'
+  }
+}
+
+/**
+ * Décision d'effort IA pour un tick (TDD/GDD v0.5 §12.2).
+ * Mute `rider.aiState` et renvoie le nouvel `effortMode`.
+ *
+ * Ordre de priorité :
+ *  1. EXPLODED   — Endurance à 0, état terminal pour la course → Éco
+ *  2. ATTACKING  — tient jusqu'à quasi-épuisement du W' (hystérésis)
+ *  3. RECOVERING — Éco forcé jusqu'à reconstitution du W' (sauf sprint final)
+ *  4. Tentative d'attaque selon le profil → ATTACKING
+ *  5. FOLLOWING  — effort de base selon profil et terrain
+ *
+ * @param {Object} rider   - coureur IA (rider.aiProfile non null ; sinon no-op)
+ * @param {Object} context - { route } — route expose getGradientAt(splinePos) et totalLength
+ * @returns {string} effortMode ('eco' | 'maintien' | 'attaque')
+ */
+export function aiDecide(rider, context = {}) {
+  // Coureur joueur : aucune décision IA, on laisse son effortMode tel quel.
+  if (!rider.aiProfile) return rider.effortMode
+
+  const { route } = context
+  const energy = rider.energy
+  const wRatio = energy.wPrime.current / energy.wPrime.max
+  const gradient = route?.getGradientAt ? route.getGradientAt(rider.splinePos) : 0
+  const distanceToFinish = route?.totalLength != null
+    ? Math.max(0, route.totalLength - rider.splinePos)
+    : Infinity
+
+  const sprintCfg = AI_PROFILES.sprinteur
+  const isFinalSprint = rider.aiProfile === 'sprinteur' && distanceToFinish <= sprintCfg.sprintDistM
+
+  // 1. Explosion — irréversible sur la course
+  if (energy.exploded) {
+    rider.aiState = AI_STATES.EXPLODED
+    return 'eco'
+  }
+
+  // 2. Attaque en cours : on tient jusqu'à épuisement quasi-total du W'
+  if (rider.aiState === AI_STATES.ATTACKING) {
+    if (wRatio < WPRIME_ATTACK_EXIT) {
+      rider.aiState = AI_STATES.RECOVERING
+    } else {
+      return 'attaque'
+    }
+  }
+
+  // 3. Récupération : priorité, sauf sprint final (dernière carte malgré tout)
+  if (rider.aiState === AI_STATES.RECOVERING) {
+    if (wRatio >= WPRIME_RECOVER_EXIT || isFinalSprint) {
+      rider.aiState = AI_STATES.FOLLOWING
+    } else {
+      return 'eco'
+    }
+  } else if (wRatio < WPRIME_RECOVER_ENTER && !isFinalSprint) {
+    rider.aiState = AI_STATES.RECOVERING
+    return 'eco'
+  }
+
+  // 4. Tentative d'attaque selon le profil
+  if (shouldAttack(rider, gradient, distanceToFinish, wRatio)) {
+    rider.aiState = AI_STATES.ATTACKING
+    return 'attaque'
+  }
+
+  // 5. Suivi normal
+  rider.aiState = AI_STATES.FOLLOWING
+  return baseEffortMode(rider, gradient, distanceToFinish)
+}
+
 
 // ─── Consommation d'énergie ──────────────────────────────────────────────────
 /**

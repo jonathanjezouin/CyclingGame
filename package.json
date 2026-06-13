@@ -16,11 +16,11 @@
     "vue": "^3.4.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.0.0",
+    "@vitejs/plugin-vue": "^6.0.7",
     "concurrently": "^8.2.0",
     "electron": "^42.0.0",
     "electron-builder": "^26.15.2",
-    "vite": "^6.4.2",
+    "vite": "^8.0.16",
     "vite-plugin-electron": "^0.28.0",
     "vitest": "^4.1.8",
     "wait-on": "^9.0.10"

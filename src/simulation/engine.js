@@ -58,6 +58,11 @@ const WPRIME_RECOVER_ENTER = 0.15  // sous ce seuil → RECOVERING (Éco forcé)
 const WPRIME_RECOVER_EXIT  = 0.40  // au-dessus → sortie de RECOVERING
 const WPRIME_ATTACK_EXIT   = 0.15  // sous ce seuil → fin d'attaque (RECOVERING)
 
+// Nombre maximum d'entrées conservées dans rider.aiLog (B1 — fiche coureur).
+// Une entrée par CHANGEMENT d'état/mode (pas par tick) : reste lisible même
+// sur une longue course. Les plus anciennes sont évincées (FIFO).
+export const AI_LOG_MAX_ENTRIES = 20
+
 // Profils IA — stratégie d'effort selon le terrain (TDD v0.5 §12.2).
 // equipier : "calque sur le leader d'équipe" nécessite un modèle d'équipe
 // (team_id / leader_id) non encore présent dans le schéma roster — en
@@ -133,6 +138,10 @@ export function createRider(overrides = {}) {
     effortMode: 'maintien',
     distanceTravelled: 0,
     screenCount: 0,        // écrans devant dans le cône (Bloc A) — calculé par la boucle
+    // B1 — fiche coureur : journal des changements de décision IA
+    // (aiState/effortMode), le plus récent en dernier. No-op pour le joueur
+    // (aiDecide() ne l'appelle jamais). Voir AI_LOG_MAX_ENTRIES.
+    aiLog: [],
     ...overrides,
   }
 }
@@ -512,9 +521,91 @@ export function baseEffortMode(rider, gradient, distanceToFinish) {
   }
 }
 
+// ─── B1 — Journal de raisonnement IA (fiche coureur) ────────────────────────
+// Formate une fraction en pourcentage entier pour les messages de raisonnement.
+const _pct = (ratio) => Math.round(ratio * 100)
+
+/**
+ * Explication lisible d'une tentative d'attaque réussie (shouldAttack === true),
+ * miroir de shouldAttack() pour chaque profil — TDD/GDD v0.5 §12.2.
+ */
+function _attackReason(rider, gradient, distanceToFinish, wRatio) {
+  const profile = AI_PROFILES[rider.aiProfile]
+  switch (rider.aiProfile) {
+    case 'grimpeur':
+      return `Attaque (grimpeur) : pente ${gradient.toFixed(1)}% ≥ seuil ${profile.attackGradientMin}%, `
+        + `W' ${_pct(wRatio)}% ≥ seuil ${_pct(profile.attackWPrimeMin)}%.`
+    case 'rouleur':
+      return `Attaque (rouleur) : pente ${gradient.toFixed(1)}% ≤ seuil plat ${profile.attackGradientMax}%, `
+        + `W' ${_pct(wRatio)}% ≥ seuil ${_pct(profile.attackWPrimeMin)}%.`
+    case 'sprinteur':
+      return `Attaque (sprinteur) : sprint final, ${Math.round(distanceToFinish)}m ≤ ${profile.sprintDistM}m de l'arrivée.`
+    default:
+      return `Attaque (${rider.aiProfile}).`
+  }
+}
+
+/**
+ * Explication lisible du mode de croisière choisi par baseEffortMode(),
+ * miroir de sa logique pour chaque profil — TDD/GDD v0.5 §12.2.
+ */
+function _followingReason(rider, gradient, distanceToFinish, mode) {
+  const profile = AI_PROFILES[rider.aiProfile]
+  const modeLabel = EFFORT_MODES[mode]?.label ?? mode
+  switch (rider.aiProfile) {
+    case 'grimpeur':
+      return gradient >= profile.climbGradientMin
+        ? `Suivi (grimpeur) : pente ${gradient.toFixed(1)}% ≥ ${profile.climbGradientMin}% → ${modeLabel} (terrain favorable).`
+        : `Suivi (grimpeur) : pente ${gradient.toFixed(1)}% < ${profile.climbGradientMin}% → ${modeLabel} (garde les jambes pour la montée).`
+    case 'rouleur':
+    case 'equipier':
+      return gradient >= profile.climbGradientMin
+        ? `Suivi (${rider.aiProfile}) : pente ${gradient.toFixed(1)}% ≥ ${profile.climbGradientMin}% → ${modeLabel} (montagne, pas son terrain).`
+        : `Suivi (${rider.aiProfile}) : pente ${gradient.toFixed(1)}% < ${profile.climbGradientMin}% → ${modeLabel} (plat/faux-plat, son terrain).`
+    case 'sprinteur':
+      return distanceToFinish <= profile.maintienDistM
+        ? `Suivi (sprinteur) : ${Math.round(distanceToFinish)}m de l'arrivée ≤ ${profile.maintienDistM}m → ${modeLabel} (se replace avant le sprint).`
+        : `Suivi (sprinteur) : ${Math.round(distanceToFinish)}m de l'arrivée > ${profile.maintienDistM}m → ${modeLabel} (économise).`
+    default:
+      return `Suivi (${rider.aiProfile}) → ${modeLabel}.`
+  }
+}
+
+/**
+ * Ajoute une entrée au journal de raisonnement (rider.aiLog) si l'aiState ou
+ * l'effortMode change — ou s'il s'agit de la toute première décision. Évite
+ * le bruit d'une entrée par tick en régime stable (B1 — fiche coureur).
+ *
+ * @param {Object} rider
+ * @param {number|null} simSec - horodatage simulé (context.simSec)
+ * @param {string} aiState
+ * @param {string} effortMode
+ * @param {string} reason
+ */
+function _logAiDecision(rider, simSec, aiState, effortMode, reason) {
+  if (!rider.aiLog) rider.aiLog = []
+  const last = rider.aiLog[rider.aiLog.length - 1]
+  const changed = !last || last.aiState !== aiState || last.effortMode !== effortMode
+  if (changed) {
+    rider.aiLog.push({ simSec: simSec ?? null, aiState, effortMode, reason })
+    if (rider.aiLog.length > AI_LOG_MAX_ENTRIES) rider.aiLog.shift()
+  }
+}
+
+/**
+ * Mute rider.aiState, consigne la décision dans rider.aiLog (si changement),
+ * et renvoie l'effortMode — point de sortie unique de aiDecide().
+ */
+function _decide(rider, simSec, aiState, effortMode, reason) {
+  rider.aiState = aiState
+  _logAiDecision(rider, simSec, aiState, effortMode, reason)
+  return effortMode
+}
+
 /**
  * Décision d'effort IA pour un tick (TDD/GDD v0.5 §12.2).
- * Mute `rider.aiState` et renvoie le nouvel `effortMode`.
+ * Mute `rider.aiState` (et consigne dans `rider.aiLog`, B1) et renvoie le
+ * nouvel `effortMode`.
  *
  * Ordre de priorité :
  *  1. EXPLODED   — Endurance à 0, état terminal pour la course → Éco
@@ -524,14 +615,16 @@ export function baseEffortMode(rider, gradient, distanceToFinish) {
  *  5. FOLLOWING  — effort de base selon profil et terrain
  *
  * @param {Object} rider   - coureur IA (rider.aiProfile non null ; sinon no-op)
- * @param {Object} context - { route } — route expose getGradientAt(splinePos) et totalLength
+ * @param {Object} context - { route, simSec } — route expose getGradientAt(splinePos)
+ *                            et totalLength ; simSec = horodatage simulé (B1, optionnel)
  * @returns {string} effortMode ('eco' | 'maintien' | 'attaque')
  */
 export function aiDecide(rider, context = {}) {
-  // Coureur joueur : aucune décision IA, on laisse son effortMode tel quel.
+  // Coureur joueur : aucune décision IA, on laisse son effortMode tel quel —
+  // et pas de journal (la "fiche coureur" du joueur n'a pas de raisonnement IA).
   if (!rider.aiProfile) return rider.effortMode
 
-  const { route } = context
+  const { route, simSec } = context
   const energy = rider.energy
   const wRatio = energy.wPrime.current / energy.wPrime.max
   const gradient = route?.getGradientAt ? route.getGradientAt(rider.splinePos) : 0
@@ -544,40 +637,50 @@ export function aiDecide(rider, context = {}) {
 
   // 1. Explosion — irréversible sur la course
   if (energy.exploded) {
-    rider.aiState = AI_STATES.EXPLODED
-    return 'eco'
+    return _decide(rider, simSec, AI_STATES.EXPLODED, 'eco',
+      `Endurance épuisée → explosion (irréversible), Éco forcé.`)
   }
 
   // 2. Attaque en cours : on tient jusqu'à épuisement quasi-total du W'
   if (rider.aiState === AI_STATES.ATTACKING) {
     if (wRatio < WPRIME_ATTACK_EXIT) {
-      rider.aiState = AI_STATES.RECOVERING
-    } else {
-      return 'attaque'
+      return _decide(rider, simSec, AI_STATES.RECOVERING, 'eco',
+        `Fin d'attaque : W' ${_pct(wRatio)}% < seuil de sortie ${_pct(WPRIME_ATTACK_EXIT)}% → récupération (Éco).`)
     }
+    return _decide(rider, simSec, AI_STATES.ATTACKING, 'attaque',
+      `Attaque maintenue : W' ${_pct(wRatio)}% ≥ seuil de sortie ${_pct(WPRIME_ATTACK_EXIT)}% (hystérésis).`)
   }
 
   // 3. Récupération : priorité, sauf sprint final (dernière carte malgré tout)
+  // transitionNote : mémorise pourquoi on sort de RECOVERING, pour l'ajouter
+  // au raisonnement de l'étape suivante (4 ou 5) qui détermine le mode réel.
+  let transitionNote = null
   if (rider.aiState === AI_STATES.RECOVERING) {
-    if (wRatio >= WPRIME_RECOVER_EXIT || isFinalSprint) {
-      rider.aiState = AI_STATES.FOLLOWING
+    if (wRatio >= WPRIME_RECOVER_EXIT) {
+      transitionNote = `Sortie de récupération : W' ${_pct(wRatio)}% ≥ seuil ${_pct(WPRIME_RECOVER_EXIT)}%.`
+    } else if (isFinalSprint) {
+      transitionNote = `Sprint final malgré récupération (W' ${_pct(wRatio)}%) — tente sa chance.`
     } else {
-      return 'eco'
+      return _decide(rider, simSec, AI_STATES.RECOVERING, 'eco',
+        `Récupération en cours : W' ${_pct(wRatio)}% < seuil de sortie ${_pct(WPRIME_RECOVER_EXIT)}% → Éco forcé.`)
     }
   } else if (wRatio < WPRIME_RECOVER_ENTER && !isFinalSprint) {
-    rider.aiState = AI_STATES.RECOVERING
-    return 'eco'
+    return _decide(rider, simSec, AI_STATES.RECOVERING, 'eco',
+      `Réserve W' faible : ${_pct(wRatio)}% < seuil d'entrée en récupération ${_pct(WPRIME_RECOVER_ENTER)}% → Éco forcé.`)
   }
 
   // 4. Tentative d'attaque selon le profil
   if (shouldAttack(rider, gradient, distanceToFinish, wRatio)) {
-    rider.aiState = AI_STATES.ATTACKING
-    return 'attaque'
+    const reason = _attackReason(rider, gradient, distanceToFinish, wRatio)
+    return _decide(rider, simSec, AI_STATES.ATTACKING, 'attaque',
+      transitionNote ? `${transitionNote} ${reason}` : reason)
   }
 
   // 5. Suivi normal
-  rider.aiState = AI_STATES.FOLLOWING
-  return baseEffortMode(rider, gradient, distanceToFinish)
+  const mode = baseEffortMode(rider, gradient, distanceToFinish)
+  const reason = _followingReason(rider, gradient, distanceToFinish, mode)
+  return _decide(rider, simSec, AI_STATES.FOLLOWING, mode,
+    transitionNote ? `${transitionNote} ${reason}` : reason)
 }
 
 

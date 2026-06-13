@@ -58,6 +58,33 @@ const WPRIME_RECOVER_ENTER = 0.15  // sous ce seuil → RECOVERING (Éco forcé)
 const WPRIME_RECOVER_EXIT  = 0.40  // au-dessus → sortie de RECOVERING
 const WPRIME_ATTACK_EXIT   = 0.15  // sous ce seuil → fin d'attaque (RECOVERING)
 
+
+// ─── IA-L1 — Effort dynamique par budget (PBI v1.1, §2) ─────────────────────
+// Paramètres par défaut injectés dans createAIRider / createRidersFromRoster.
+// Chaque coureur peut les surcharger (« personnalités individuelles »).
+// attackThreshold  : surplus (fraction de wPrime.max) au-dessus duquel le
+//   coureur ose attaquer — remplace les seuils fixes de shouldAttack().
+// safetyMargin     : fraction de wPrime.max à garder en réserve en arrivant
+//   au moment décisif ; si la projection détecte un déficit (budget < −margin),
+//   la zone de croisière est rétrogradée d'un cran (Maintien → Éco, etc.).
+const IA_L1_DEFAULTS = {
+  attackThreshold: 0.20,   // surplus ≥ 20% wPrime.max → peut attaquer
+  safetyMargin:    0.10,   // marge de sécurité : budget < −10% → lever le pied
+}
+// Palier d'ajustement de zone (±1) — fraction de wPrime.max.
+// Si budget > +attackThreshold     → tenter une attaque (ATTACKING)
+// Si budget < −safetyMargin        → rétrograder la zone de croisière (Éco)
+// Sinon                            → garder la zone de croisière nominale
+
+// ─── IA-L2 — Réactions sociales (PBI v1.1, §2) ──────────────────────────────
+// Seuil (m) sous lequel un écart avec le groupe de devant est considéré comme
+// « menaçant le résultat » → le coureur prend des relais (Z3/Maintien forcé).
+const IA_L2_GAP_THREAT_M = 150   // au-delà, pas de relais — l'écart n'est pas récupérable à court terme
+// Fenêtre de détection des attaques rivales (ticks) : on considère qu'un
+// coureur vient de lancer une attaque s'il est passé en ATTACKING dans les
+// IA_L2_ATTACK_WINDOW dernières secondes simulées.
+const IA_L2_ATTACK_WINDOW_TICKS = 3
+
 // Nombre maximum d'entrées conservées dans rider.aiLog (B1 — fiche coureur).
 // Une entrée par CHANGEMENT d'état/mode (pas par tick) : reste lisible même
 // sur une longue course. Les plus anciennes sont évincées (FIFO).
@@ -167,6 +194,9 @@ export function createAIRider(overrides = {}) {
       dayFormMod: 1.0,
     },
     effortMode: 'maintien',
+    // IA-L1 : paramètres de personnalité individuelle (remplacent les seuils statiques)
+    attackThreshold: IA_L1_DEFAULTS.attackThreshold,
+    safetyMargin:    IA_L1_DEFAULTS.safetyMargin,
     ...overrides,
   })
 }
@@ -216,6 +246,11 @@ export function createRidersFromRoster(roster, opts = {}) {
         dayFormMod: 1.0,
       },
       effortMode: isPlayer ? 'maintien' : 'eco',
+      // IA-L1 : personnalité individuelle (surcharge possible dans le roster JSON)
+      ...(isPlayer ? {} : {
+        attackThreshold: entry.attackThreshold ?? IA_L1_DEFAULTS.attackThreshold,
+        safetyMargin:    entry.safetyMargin    ?? IA_L1_DEFAULTS.safetyMargin,
+      }),
     })
   })
 }
@@ -521,6 +556,171 @@ export function baseEffortMode(rider, gradient, distanceToFinish) {
   }
 }
 
+
+// ─── IA-L1 — computeBudget() (PBI v1.1, §2) ──────────────────────────────────
+/**
+ * Calcule le surplus/déficit de W' à l'horizon du prochain moment décisif.
+ *
+ * Projection en deux étapes :
+ *   1. Coût W' de la croisière neutre (Maintien) jusqu'au moment décisif, via
+ *      projectCost() (algorithme C1 déjà en place).
+ *   2. Budget = wPrime.current − coût_projeté (en joules) − safetyMargin × wPrime.max.
+ *
+ * Retourne le budget en joules (positif = surplus, négatif = déficit).
+ * Un budget > attackThreshold × wPrime.max → le coureur peut attaquer.
+ * Un budget < 0 → le coureur doit lever le pied (Éco).
+ *
+ * @param {Object} rider   - doit exposer energy, splinePos, aiProfile, screenCount, speedKmh
+ * @param {Object} route   - route courante (getGradientAt, totalLength, segments, keyPoints)
+ * @returns {{ budget: number, moment: Object, costJ: number }}
+ */
+export function computeBudget(rider, route) {
+  const moment = getNextDecisiveMoment(rider, route)
+  const distanceM = moment.distanceM
+
+  // Projection du coût W' en croisière neutre (Maintien)
+  const proj = projectCost('maintien', rider, route, distanceM)
+  // proj.wPrimePct : fraction du max (négatif = récup, positif = coût)
+  const costJ = proj.wPrimePct * rider.energy.wPrime.max
+
+  const margin = (rider.safetyMargin ?? IA_L1_DEFAULTS.safetyMargin) * rider.energy.wPrime.max
+  const budget = rider.energy.wPrime.current - costJ - margin
+
+  return { budget, moment, costJ }
+}
+
+/**
+ * Zone de croisière nominale selon profil et terrain.
+ * Identique à l'ancienne baseEffortMode() mais renommée pour clarté.
+ * Utilisée comme point de départ avant l'ajustement IA-L1.
+ *
+ * @param {Object} rider
+ * @param {number} gradient
+ * @param {number} distanceToFinish
+ * @returns {'eco'|'maintien'}
+ */
+function _nominalCruise(rider, gradient, distanceToFinish) {
+  return baseEffortMode(rider, gradient, distanceToFinish)
+}
+
+/**
+ * Raison lisible pour le log lorsque IA-L1 ajuste la zone de croisière.
+ */
+function _budgetReason(rider, budget, moment, nominal, effective) {
+  const wMax = rider.energy.wPrime.max
+  const budgetPct = Math.round((budget / wMax) * 100)
+  const thr = Math.round((rider.attackThreshold ?? IA_L1_DEFAULTS.attackThreshold) * 100)
+  const margin = Math.round((rider.safetyMargin ?? IA_L1_DEFAULTS.safetyMargin) * 100)
+  const nomLabel = EFFORT_MODES[nominal]?.label ?? nominal
+  const effLabel = EFFORT_MODES[effective]?.label ?? effective
+  const momentLabel = moment.name ?? moment.type
+
+  if (effective === 'attaque') {
+    return `Budget IA-L1 : surplus W' ${budgetPct > 0 ? '+' : ''}${budgetPct}% ≥ seuil attaque +${thr}% → Attaque avant ${momentLabel}.`
+  } else if (effective === 'eco' && nominal !== 'eco') {
+    return `Budget IA-L1 : déficit W' ${budgetPct > 0 ? '+' : ''}${budgetPct}% < −${margin}% → ${effLabel} (économise pour ${momentLabel}).`
+  } else {
+    return `Budget IA-L1 : surplus W' ${budgetPct > 0 ? '+' : ''}${budgetPct}% dans la fourchette → ${nomLabel} (neutre).`
+  }
+}
+
+// ─── IA-L2 — Réactions sociales (PBI v1.1, §2) ──────────────────────────────
+
+/**
+ * Évalue si un coureur voisin `other` vient de lancer une attaque.
+ * Heuristique : il est en ATTACKING depuis ≤ IA_L2_ATTACK_WINDOW_TICKS ticks.
+ * On s'appuie sur rider.aiLog (B1) : la dernière entrée ATTACKING doit être
+ * récente (simSec de l'entrée ≥ simSec courant − fenêtre).
+ *
+ * @param {Object} other    - coureur voisin
+ * @param {number} simSec   - temps simulé courant
+ * @returns {boolean}
+ */
+function _justAttacked(other, simSec) {
+  if (other.aiState !== AI_STATES.ATTACKING) return false
+  if (!other.aiLog || other.aiLog.length === 0) return true // en ATTACKING sans log = récent
+  const lastEntry = other.aiLog[other.aiLog.length - 1]
+  if (lastEntry.aiState !== AI_STATES.ATTACKING) return false
+  if (lastEntry.simSec == null) return true
+  return (simSec - lastEntry.simSec) <= IA_L2_ATTACK_WINDOW_TICKS
+}
+
+/**
+ * Couche 2 — Réactions sociales : réponse aux attaques et prise de relais.
+ * Évaluée AVANT la Couche 1 (budget) à chaque tick.
+ *
+ * Deux règles d'intérêt individuel (sans alliances explicites) :
+ *  A. Réponse aux attaques : un voisin du même groupe vient-il d'attaquer ?
+ *     S'il a le même aiProfile (rival potentiel) et que le budget le permet,
+ *     le coureur répond (bascule ATTACKING). Sinon il laisse filer.
+ *  B. Prise de relais : l'écart avec le groupe de devant est sous le seuil
+ *     de menace ET un rival s'y trouve → le coureur force Maintien (Z3) pour
+ *     contribuer à la chasse, plutôt que de « sucer la roue ».
+ *
+ * Retourne un objet de décision ou null si aucune réaction sociale n'est
+ * déclenchée (la Couche 1 prend alors le relais normalement).
+ *
+ * @param {Object} rider   - coureur IA décidant
+ * @param {Array}  riders  - tous les coureurs (pour voir les voisins)
+ * @param {Array}  groups  - sortie updateGroups() (ordonnés avant → arrière)
+ * @param {number} budget  - budget W' de la Couche 1 (joules)
+ * @param {number} simSec  - temps simulé courant
+ * @returns {{ effortMode: string, reason: string, aiState: string } | null}
+ */
+export function socialReaction(rider, riders, groups, budget, simSec) {
+  const wMax = rider.energy.wPrime.max
+  const attackBudgetJ = (rider.attackThreshold ?? IA_L1_DEFAULTS.attackThreshold) * wMax
+
+  // ── A. Réponse aux attaques ───────────────────────────────────────────────
+  const rivals = riders.filter(r =>
+    r.id !== rider.id &&
+    r.group === rider.group &&
+    r.aiProfile === rider.aiProfile &&
+    !r.isPlayer
+  )
+
+  for (const rival of rivals) {
+    if (_justAttacked(rival, simSec)) {
+      if (budget >= attackBudgetJ) {
+        return {
+          aiState: AI_STATES.ATTACKING,
+          effortMode: 'attaque',
+          reason: `IA-L2 : ${rival.name} (${rival.aiProfile}) attaque — budget W' suffisant (+${Math.round((budget/wMax)*100)}%) → réponse immédiate.`,
+        }
+      } else {
+        // Pas de retour null ici — on laisse IA-L1 décider du mode, mais
+        // on log la décision de laisser filer (via raison dans FOLLOWING).
+        // Règle : ne pas forcer un mode ici si on n'attaque pas — IA-L1 ajuste.
+        // On renvoie null pour que IA-L1 reste souveraine sur le mode de croisière.
+        // (Le log de raison sera produit par aiDecide via _budgetReason.)
+        return null
+      }
+    }
+  }
+
+  // ── B. Prise de relais ────────────────────────────────────────────────────
+  const gap = gapToGroupAhead(rider, groups)
+  if (gap !== Infinity && gap <= IA_L2_GAP_THREAT_M) {
+    // Y a-t-il un rival (même profil) dans le groupe de devant ?
+    const idx = groups.findIndex(g => g.name === rider.group)
+    if (idx > 0) {
+      const groupAhead = groups[idx - 1]
+      const rivalAhead = groupAhead.riders.some(r =>
+        r.aiProfile === rider.aiProfile && !r.isPlayer
+      )
+      if (rivalAhead && budget >= 0) {
+        return {
+          aiState: AI_STATES.FOLLOWING,
+          effortMode: 'maintien',
+          reason: `IA-L2 : écart ${Math.round(gap)}m ≤ ${IA_L2_GAP_THREAT_M}m (rival devant, même profil) → relais Maintien pour revenir.`,
+        }
+      }
+    }
+  }
+
+  return null // aucune réaction sociale → Couche 1 décide
+}
+
 // ─── B1 — Journal de raisonnement IA (fiche coureur) ────────────────────────
 // Formate une fraction en pourcentage entier pour les messages de raisonnement.
 const _pct = (ratio) => Math.round(ratio * 100)
@@ -642,6 +842,7 @@ export function aiDecide(rider, context = {}) {
   }
 
   // 2. Attaque en cours : on tient jusqu'à épuisement quasi-total du W'
+  //    (hystérésis — évite le flip-flop tick par tick)
   if (rider.aiState === AI_STATES.ATTACKING) {
     if (wRatio < WPRIME_ATTACK_EXIT) {
       return _decide(rider, simSec, AI_STATES.RECOVERING, 'eco',
@@ -652,8 +853,6 @@ export function aiDecide(rider, context = {}) {
   }
 
   // 3. Récupération : priorité, sauf sprint final (dernière carte malgré tout)
-  // transitionNote : mémorise pourquoi on sort de RECOVERING, pour l'ajouter
-  // au raisonnement de l'étape suivante (4 ou 5) qui détermine le mode réel.
   let transitionNote = null
   if (rider.aiState === AI_STATES.RECOVERING) {
     if (wRatio >= WPRIME_RECOVER_EXIT) {
@@ -669,18 +868,53 @@ export function aiDecide(rider, context = {}) {
       `Réserve W' faible : ${_pct(wRatio)}% < seuil d'entrée en récupération ${_pct(WPRIME_RECOVER_ENTER)}% → Éco forcé.`)
   }
 
-  // 4. Tentative d'attaque selon le profil
-  if (shouldAttack(rider, gradient, distanceToFinish, wRatio)) {
-    const reason = _attackReason(rider, gradient, distanceToFinish, wRatio)
-    return _decide(rider, simSec, AI_STATES.ATTACKING, 'attaque',
-      transitionNote ? `${transitionNote} ${reason}` : reason)
+  // ── IA-L1 — Budget W' jusqu'au prochain moment décisif ──────────────────
+  // computeBudget() projette le coût de la croisière neutre (Maintien) et
+  // calcule le surplus ou déficit par rapport à la marge de sécurité du coureur.
+  const { budget, moment } = computeBudget(rider, route)
+  const wMax = energy.wPrime.max
+  const attackBudgetJ = (rider.attackThreshold ?? IA_L1_DEFAULTS.attackThreshold) * wMax
+  const safetyJ       = (rider.safetyMargin    ?? IA_L1_DEFAULTS.safetyMargin)    * wMax
+
+  // ── IA-L2 — Réactions sociales (avant la décision de Couche 1) ───────────
+  // socialReaction() lit `context.riders` et `context.groups` — fournis par
+  // la boucle dans le contexte enrichi de aiDecide().
+  const allRiders = context.riders ?? []
+  const allGroups = context.groups ?? []
+  const social = socialReaction(rider, allRiders, allGroups, budget, simSec ?? 0)
+  if (social) {
+    // IA-L2 a décidé (attaque-réponse ou relais) — on applique directement.
+    const reason = transitionNote ? `${transitionNote} ${social.reason}` : social.reason
+    return _decide(rider, simSec, social.aiState, social.effortMode, reason)
   }
 
-  // 5. Suivi normal
-  const mode = baseEffortMode(rider, gradient, distanceToFinish)
-  const reason = _followingReason(rider, gradient, distanceToFinish, mode)
-  return _decide(rider, simSec, AI_STATES.FOLLOWING, mode,
-    transitionNote ? `${transitionNote} ${reason}` : reason)
+  // 4. Tentative d'attaque IA-L1 : budget suffisant ET conditions de profil
+  //    (le gradient/profil sert de filtre contextuel : un grimpeur n'attaque
+  //    pas sur le plat même s'il a du budget)
+  if (budget >= attackBudgetJ && shouldAttack(rider, gradient, distanceToFinish, wRatio)) {
+    const reason = _budgetReason(rider, budget, moment, 'attaque', 'attaque')
+    const attackReason = _attackReason(rider, gradient, distanceToFinish, wRatio)
+    return _decide(rider, simSec, AI_STATES.ATTACKING, 'attaque',
+      transitionNote ? `${transitionNote} ${reason} ${attackReason}` : `${reason} ${attackReason}`)
+  }
+
+  // 5. Croisière IA-L1 : zone nominale ajustée selon le budget
+  const nominal = _nominalCruise(rider, gradient, distanceToFinish)
+  let effective = nominal
+
+  if (budget < -safetyJ) {
+    // Déficit : lever le pied — rétrograder d'un cran (Maintien → Éco)
+    effective = nominal === 'attaque' ? 'maintien' : 'eco'
+  }
+  // Note : surplus sans condition d'attaque de profil → on garde la croisière
+  // nominale (pas d'attaque forcée sans contexte favorable).
+
+  const reason = _budgetReason(rider, budget, moment, nominal, effective)
+  const followingReason = _followingReason(rider, gradient, distanceToFinish, effective)
+  return _decide(rider, simSec, AI_STATES.FOLLOWING, effective,
+    transitionNote
+      ? `${transitionNote} ${reason} ${followingReason}`
+      : `${reason} ${followingReason}`)
 }
 
 

@@ -132,6 +132,10 @@ export const ZONES = {
 export const EFFORT_MODES = {
   eco:      { label: 'Éco',     ftpFactor: 0.65, zone: ZONES.Z2, color: '#34d399' },
   maintien: { label: 'Maintien',ftpFactor: 0.85, zone: ZONES.Z3, color: '#fbbf24' },
+  // IA-L1bis — Follow group (PBI v1.1+) : palier intermédiaire entre Maintien
+  // et Attaque. Représente « je force pour rester dans la roue », pas une
+  // tentative offensive — d'où une couleur distincte de Z4 standard.
+  suivre:   { label: 'Suivre',  ftpFactor: 0.95, zone: ZONES.Z4, color: '#fb923c' },
   attaque:  { label: 'Attaque', ftpFactor: 1.15, zone: ZONES.Z5, color: '#ef4444' },
 }
 
@@ -165,6 +169,10 @@ export function createRider(overrides = {}) {
     effortMode: 'maintien',
     distanceTravelled: 0,
     screenCount: 0,        // écrans devant dans le cône (Bloc A) — calculé par la boucle
+    // IA-L1bis — Follow group : screenCount du tick précédent, pour détecter
+    // la perte d'aspiration (transition >0 → 0). Mis à jour par la boucle
+    // juste avant le recalcul de screenCount.
+    prevScreenCount: 0,
     // B1 — fiche coureur : journal des changements de décision IA
     // (aiState/effortMode), le plus récent en dernier. No-op pour le joueur
     // (aiDecide() ne l'appelle jamais). Voir AI_LOG_MAX_ENTRIES.
@@ -721,6 +729,67 @@ export function socialReaction(rider, riders, groups, budget, simSec) {
   return null // aucune réaction sociale → Couche 1 décide
 }
 
+
+// ─── IA-L1bis — Follow group (perte d'aspiration) ───────────────────────────
+// Le décrochage perceptible n'est pas la cassure officielle de groupe
+// (GROUP_GAP_THRESHOLD_M = 25m, purement longitudinal) mais la perte
+// d'aspiration : le coureur sort du cône de draft du coureur qui le précède
+// (DRAFT_CONE_DIST_M = 10m, ±30°). C'est plus tôt, et c'est ce que le
+// coureur "sent" en premier.
+
+/**
+ * Détecte si `rider` vient de perdre l'aspiration à ce tick :
+ * screenCount > 0 au tick précédent, et = 0 au tick courant.
+ *
+ * @param {Object} rider - expose screenCount (courant) et prevScreenCount (précédent)
+ * @returns {boolean}
+ */
+export function justLostDraft(rider) {
+  return (rider.prevScreenCount ?? 0) > 0 && (rider.screenCount ?? 0) === 0
+}
+
+/**
+ * Mécanisme « follow group » (IA-L1bis) : si le coureur vient de perdre
+ * l'aspiration et que son budget W' (IA-L1) le permet, il monte d'un palier
+ * vers 'suivre' (Z4 bas, ~0.95 FTP) pour rester dans la roue — un effort
+ * soutenu mais pas une attaque.
+ *
+ * Le seuil de consentement réutilise safetyMargin (même paramètre que la
+ * rétrogradation IA-L1) : un coureur prudent (grosse marge) lâchera plus
+ * facilement le groupe plutôt que de forcer pour suivre.
+ *
+ * Ne s'applique qu'à partir de la zone de croisière nominale 'eco' ou
+ * 'maintien' — si le coureur est déjà en 'attaque' (ou ATTACKING/RECOVERING/
+ * EXPLODED, gérés en amont dans aiDecide), follow-group ne s'applique pas.
+ *
+ * @param {Object} rider  - expose energy.wPrime, safetyMargin
+ * @param {number} budget - budget W' de la Couche 1 (joules, computeBudget())
+ * @param {string} nominal - zone de croisière nominale ('eco' | 'maintien')
+ * @returns {{ effortMode: string, reason: string } | null}
+ */
+export function followGroupReaction(rider, budget, nominal) {
+  if (!justLostDraft(rider)) return null
+  if (nominal !== 'eco' && nominal !== 'maintien') return null
+
+  const wMax = rider.energy.wPrime.max
+  const safetyJ = (rider.safetyMargin ?? IA_L1_DEFAULTS.safetyMargin) * wMax
+
+  // Consentement : budget suffisant pour absorber le surcoût de 'suivre'
+  // sans entamer la marge de sécurité.
+  if (budget >= safetyJ) {
+    const budgetPct = Math.round((budget / wMax) * 100)
+    return {
+      effortMode: 'suivre',
+      reason: `IA-L1bis : perte d'aspiration détectée (screenCount 0) — budget W' +${budgetPct}% ≥ marge ${Math.round((rider.safetyMargin ?? IA_L1_DEFAULTS.safetyMargin)*100)}% → Suivre (force pour rester dans la roue).`,
+    }
+  }
+
+  // Budget insuffisant : décision rationnelle de laisser filer, pas de log
+  // de honte — on retourne null et la zone nominale (ou rétrogradée par
+  // IA-L1) s'applique normalement.
+  return null
+}
+
 // ─── B1 — Journal de raisonnement IA (fiche coureur) ────────────────────────
 // Formate une fraction en pourcentage entier pour les messages de raisonnement.
 const _pct = (ratio) => Math.round(ratio * 100)
@@ -908,6 +977,17 @@ export function aiDecide(rider, context = {}) {
   }
   // Note : surplus sans condition d'attaque de profil → on garde la croisière
   // nominale (pas d'attaque forcée sans contexte favorable).
+
+  // IA-L1bis — Follow group : perte d'aspiration ce tick + budget suffisant
+  // → monte vers 'suivre' (Z4 bas) pour rester dans la roue. Évalué sur la
+  // zone effective (après rétrogradation éventuelle) — un coureur qui se
+  // fait lâcher ET qui est en déficit n'a pas la marge pour suivre, c'est
+  // cohérent (followGroupReaction() vérifie le budget indépendamment).
+  const follow = followGroupReaction(rider, budget, effective)
+  if (follow) {
+    const reason = transitionNote ? `${transitionNote} ${follow.reason}` : follow.reason
+    return _decide(rider, simSec, AI_STATES.FOLLOWING, follow.effortMode, reason)
+  }
 
   const reason = _budgetReason(rider, budget, moment, nominal, effective)
   const followingReason = _followingReason(rider, gradient, distanceToFinish, effective)

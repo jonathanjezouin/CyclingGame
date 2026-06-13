@@ -81,6 +81,10 @@ export class SimulationLoop {
           // les ticks pour que le draft de ce tick reflète la position courante.
           this.groups = updateGroups(this.riders)
           for (const rider of this.riders) {
+            // IA-L1bis — Follow group : conserve le screenCount du tick
+            // précédent avant de le recalculer, pour détecter la perte
+            // d'aspiration (transition >0 → 0) dans aiDecide().
+            rider.prevScreenCount = rider.screenCount ?? 0
             rider.screenCount = computeScreenCount(rider, this.riders)
           }
 
@@ -88,7 +92,12 @@ export class SimulationLoop {
             // Bloc B : décision d'effort IA avant le tick (joueur exclu — aiDecide
             // est un no-op si rider.aiProfile est null, mais on évite l'appel)
             if (!rider.isPlayer) {
-              rider.effortMode = aiDecide(rider, { route: this.route, simSec: this.elapsedSimSec })
+              rider.effortMode = aiDecide(rider, {
+                route: this.route,
+                simSec: this.elapsedSimSec,
+                riders: this.riders,
+                groups: this.groups,
+              })
             }
             this._interp[rider.id].before = rider.splinePos
             simulateTick(rider, this.route, 1)

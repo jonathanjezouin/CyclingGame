@@ -88,7 +88,7 @@ export class SimulationLoop {
             // Bloc B : décision d'effort IA avant le tick (joueur exclu — aiDecide
             // est un no-op si rider.aiProfile est null, mais on évite l'appel)
             if (!rider.isPlayer) {
-              rider.effortMode = aiDecide(rider, { route: this.route })
+              rider.effortMode = aiDecide(rider, { route: this.route, simSec: this.elapsedSimSec })
             }
             this._interp[rider.id].before = rider.splinePos
             simulateTick(rider, this.route, 1)

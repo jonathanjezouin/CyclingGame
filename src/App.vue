@@ -14,6 +14,13 @@
       @togglePause="togglePause"
     />
 
+    <!-- B1 — Fiche coureur (clic gauche sur un pion) -->
+    <RiderCard
+      v-if="gameState === 'racing' && selectedRider"
+      :rider="selectedRider"
+      @close="selectedRiderId = null"
+    />
+
     <div v-if="gameState === 'racing'" class="altimetric-bar">
       <AltimetricProfile
         :track="track"
@@ -75,6 +82,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import HUD from './ui/HUD.vue'
+import RiderCard from './ui/RiderCard.vue'
 import AltimetricProfile from './ui/AltimetricProfile.vue'
 import { createRider, createAIRider, createRidersFromRoster } from './simulation/engine.js'
 import { SimulationLoop } from './simulation/loop.js'
@@ -101,6 +109,15 @@ const conesOn = ref(false)
 
 const playerRider = computed(() => riders.value.find(r => r.isPlayer))
 
+// B1 — fiche coureur (clic gauche sur un pion, Zoom 3)
+const selectedRiderId = ref(null)
+const selectedRider = computed(() => riders.value.find(r => r.id === selectedRiderId.value) ?? null)
+
+function onRiderClick(riderId) {
+  // Toggle : recliquer le même coureur referme la fiche.
+  selectedRiderId.value = selectedRiderId.value === riderId ? null : riderId
+}
+
 let renderer = null
 let simLoop  = null
 let dsTimer  = null
@@ -115,7 +132,7 @@ onMounted(() => {
 
   // Passer la largeur uniforme au renderer (pas de segments de largeur variable)
   renderer.drawRoad(spline)
-  renderer.initRiders(riders.value.map(r => ({ id: r.id, isPlayer: r.isPlayer })))
+  renderer.initRiders(riders.value.map(r => ({ id: r.id, isPlayer: r.isPlayer })), onRiderClick)
 
   // Render loop 60 FPS
   const renderLoop = () => {
@@ -249,7 +266,8 @@ function resetRace() {
   elapsedSimSec.value = 0
 
   riders.value = createRidersFromRoster(rosterData)
-  renderer.initRiders(riders.value.map(r => ({ id: r.id, isPlayer: r.isPlayer })))
+  selectedRiderId.value = null
+  renderer.initRiders(riders.value.map(r => ({ id: r.id, isPlayer: r.isPlayer })), onRiderClick)
   gameState.value = 'start'
 }
 

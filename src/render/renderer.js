@@ -169,8 +169,9 @@ export class GameRenderer {
   /**
    * Initialise les sprites pour une liste de coureurs.
    * @param {Array} riders - [{id, isPlayer, color}, ...]
+   * @param {Function} [onRiderClick] - appelé avec riderId au clic/tap sur un pion (B1)
    */
-  initRiders(riders) {
+  initRiders(riders, onRiderClick) {
     this.riderContainer.removeChildren()
     this.coneContainer.removeChildren()
     this._sprites.clear()
@@ -188,6 +189,13 @@ export class GameRenderer {
       this._cones.set(rider.id, { cone, label })
 
       const gfx = new PIXI.Graphics()
+      // B1 — fiche coureur : clic gauche (souris) / tap (tactile) sur le pion.
+      // La hit area suit la géométrie dessinée par _drawRiderShape (ellipses).
+      if (onRiderClick) {
+        gfx.eventMode = 'static'
+        gfx.cursor = 'pointer'
+        gfx.on('pointertap', () => onRiderClick(rider.id))
+      }
       this.riderContainer.addChild(gfx)
       this._sprites.set(rider.id, { gfx, prevX: 0, prevY: 0 })
     }

@@ -39,7 +39,7 @@
         <div class="track-info" v-if="track">
           <div class="track-name">{{ track.name }}</div>
           <div class="track-meta">{{ track.distance_km }} km · {{ track.type }} · {{ riders.length }} coureurs</div>
-          <div class="track-hint">Molette : zoom · Espace : pause · C : cônes d'aspiration</div>
+          <div class="track-hint">Molette : zoom · Espace : pause · C : cônes · ← → : changer de coureur suivi</div>
         </div>
         <button class="start-btn" @click="startRace">Démarrer la course</button>
       </div>
@@ -109,13 +109,40 @@ const conesOn = ref(false)
 
 const playerRider = computed(() => riders.value.find(r => r.isPlayer))
 
+// Coureur suivi par la caméra (défaut : le joueur). Les flèches ←/→ font
+// défiler le coureur suivi dans l'ordre de course ; si la fiche est ouverte,
+// elle suit le même coureur.
+const followedRiderId = ref(null)
+const followedRider = computed(() =>
+  riders.value.find(r => r.id === followedRiderId.value) ?? playerRider.value
+)
+
 // B1 — fiche coureur (clic gauche sur un pion, Zoom 3)
 const selectedRiderId = ref(null)
 const selectedRider = computed(() => riders.value.find(r => r.id === selectedRiderId.value) ?? null)
 
 function onRiderClick(riderId) {
-  // Toggle : recliquer le même coureur referme la fiche.
-  selectedRiderId.value = selectedRiderId.value === riderId ? null : riderId
+  // Clic : ouvre/ferme la fiche ET fait suivre ce coureur par la caméra.
+  if (selectedRiderId.value === riderId) {
+    selectedRiderId.value = null
+  } else {
+    selectedRiderId.value = riderId
+    followedRiderId.value = riderId
+  }
+}
+
+// Défile le coureur suivi dans l'ordre de course (splinePos décroissant =
+// de la tête vers l'arrière). dir = +1 (suivant/derrière) ou -1 (précédent/devant).
+function cycleFollowed(dir) {
+  const ordered = [...riders.value].sort((a, b) => b.splinePos - a.splinePos)
+  const curId = followedRider.value?.id
+  const idx = ordered.findIndex(r => r.id === curId)
+  const nextIdx = Math.min(ordered.length - 1, Math.max(0, (idx < 0 ? 0 : idx) + dir))
+  const next = ordered[nextIdx]
+  if (!next) return
+  followedRiderId.value = next.id
+  // Si une fiche est ouverte, elle suit le coureur sélectionné.
+  if (selectedRiderId.value) selectedRiderId.value = next.id
 }
 
 let renderer = null
@@ -136,7 +163,7 @@ onMounted(() => {
 
   // Render loop 60 FPS
   const renderLoop = () => {
-    renderer.updateRiders(riders.value, spline, playerRider.value?.id)
+    renderer.updateRiders(riders.value, spline, followedRider.value?.id)
     rafId = requestAnimationFrame(renderLoop)
   }
   rafId = requestAnimationFrame(renderLoop)
@@ -160,6 +187,11 @@ function onKeyDown(e) {
   // Bloc A : toggle debug des cônes d'aspiration
   if (e.code === 'KeyC') {
     conesOn.value = renderer ? renderer.toggleCones() : false
+  }
+  // Caméra + fiche : coureur précédent (devant) / suivant (derrière)
+  if (gameState.value === 'racing' && (e.code === 'ArrowLeft' || e.code === 'ArrowRight')) {
+    e.preventDefault()
+    cycleFollowed(e.code === 'ArrowLeft' ? -1 : 1)
   }
 }
 
@@ -267,6 +299,7 @@ function resetRace() {
 
   riders.value = createRidersFromRoster(rosterData)
   selectedRiderId.value = null
+  followedRiderId.value = null
   renderer.initRiders(riders.value.map(r => ({ id: r.id, isPlayer: r.isPlayer })), onRiderClick)
   gameState.value = 'start'
 }

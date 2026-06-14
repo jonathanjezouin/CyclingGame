@@ -56,21 +56,21 @@
 
     <!-- Panneau actions droite -->
     <div class="hud-panel hud-right">
-      <div class="panel-title">Mode d'effort</div>
+      <div class="panel-title">Zone d'effort</div>
 
-      <div class="effort-buttons">
+      <div class="zone-buttons">
         <button
-          v-for="mode in effortModes"
-          :key="mode.key"
-          class="effort-btn"
-          :class="{ active: rider.effortMode === mode.key }"
-          :style="rider.effortMode === mode.key ? { borderColor: mode.color, backgroundColor: mode.color + '22' } : {}"
-          @click="$emit('setEffort', mode.key)"
+          v-for="z in zoneChoices"
+          :key="z.id"
+          class="zone-btn"
+          :class="{ active: rider.targetZone === z.id }"
+          :style="rider.targetZone === z.id ? { borderColor: z.color, backgroundColor: z.color + '22' } : {}"
+          @click="$emit('setTargetZone', z.id)"
         >
-          <span class="btn-label" :style="rider.effortMode === mode.key ? { color: mode.color } : {}">
-            {{ mode.label }}
+          <span class="zbtn-label" :style="rider.targetZone === z.id ? { color: z.color } : {}">
+            {{ z.label }}
           </span>
-          <span class="btn-zone">{{ mode.zone }}</span>
+          <span class="zbtn-name">{{ z.name }}</span>
         </button>
       </div>
 
@@ -126,7 +126,7 @@ const props = defineProps({
   paused: { type: Boolean, default: false },
 })
 
-defineEmits(['setEffort', 'dsAction', 'setTimeScale', 'togglePause'])
+defineEmits(['setTargetZone', 'dsAction', 'setTimeScale', 'togglePause'])
 
 const endurancePct = computed(() => {
   const e = props.rider.energy.endurance
@@ -149,11 +149,9 @@ const activeZone = computed(() => {
   return Object.values(ZONES).find(zn => zn.id === z) ?? ZONES.Z2
 })
 
-const effortModes = [
-  { key: 'eco',      label: 'Éco',      zone: 'Z2',    color: '#34d399' },
-  { key: 'maintien', label: 'Maintien', zone: 'Z3–4',  color: '#fbbf24' },
-  { key: 'attaque',  label: 'Attaque',  zone: 'Z5–6',  color: '#ef4444' },
-]
+const zoneChoices = Object.values(ZONES).map(z => ({
+  id: z.id, label: z.label, name: z.name, color: z.color,
+}))
 
 const timeScales = [1, 5, 10, 30]
 </script>
@@ -322,40 +320,40 @@ const timeScales = [1, 5, 10, 30]
 }
 
 /* Actions d'effort */
-.effort-buttons {
+.zone-buttons {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.effort-btn {
+.zone-btn {
   display: flex;
   justify-content: space-between;
   align-items: center;
   background: rgba(255,255,255,0.05);
   border: 1px solid rgba(255,255,255,0.15);
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: 6px 10px;
   cursor: pointer;
   transition: all 0.15s;
   color: #fff;
 }
 
-.effort-btn:hover {
+.zone-btn:hover {
   background: rgba(255,255,255,0.1);
 }
 
-.effort-btn.active {
+.zone-btn.active {
   background: rgba(255,255,255,0.08);
 }
 
-.btn-label {
+.zbtn-label {
   font-size: 12px;
   font-weight: 600;
   color: rgba(255,255,255,0.8);
 }
 
-.btn-zone {
+.zbtn-name {
   font-size: 10px;
   color: rgba(255,255,255,0.4);
 }

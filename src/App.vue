@@ -8,7 +8,7 @@
       :dsMessage="dsMessage"
       :currentTimeScale="timeScale"
       :paused="paused"
-      @setEffort="setEffortMode"
+      @setTargetZone="setTargetZone"
       @dsAction="handleDsAction"
       @setTimeScale="setTimeScale"
       @togglePause="togglePause"
@@ -195,9 +195,9 @@ function startRace() {
 }
 
 // ─── Contrôles ───────────────────────────────────────────────────────────────
-function setEffortMode(mode) {
+function setTargetZone(zone) {
   const p = riders.value.find(r => r.isPlayer)
-  if (p) p.effortMode = mode
+  if (p) p.targetZone = zone
 }
 
 function setTimeScale(scale) {

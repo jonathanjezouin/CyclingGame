@@ -6,7 +6,7 @@
  *   rider.renderPos = position interpolée à afficher (mis à jour à 60 FPS)
  *   rider.splinePos = position simulée (mis à jour par ticks discrets)
  */
-import { simulateTick, updateGroups, computeScreenCount, aiDecide } from './engine.js'
+import { simulateTick, updateGroups, computeScreenCount, decideTargetZone } from './engine.js'
 
 export class SimulationLoop {
   /**
@@ -85,10 +85,11 @@ export class SimulationLoop {
           }
 
           for (const rider of this.riders) {
-            // Bloc B : décision d'effort IA avant le tick (joueur exclu — aiDecide
-            // est un no-op si rider.aiProfile est null, mais on évite l'appel)
+            // Couche 1 : décision de ZONE cible avant le tick (joueur exclu —
+            // il pilote sa propre zone via le HUD). decideTargetZone mute
+            // rider.targetZone et le journal de raisonnement (B1).
             if (!rider.isPlayer) {
-              rider.effortMode = aiDecide(rider, { route: this.route, simSec: this.elapsedSimSec })
+              decideTargetZone(rider, this.route, { simSec: this.elapsedSimSec })
             }
             this._interp[rider.id].before = rider.splinePos
             simulateTick(rider, this.route, 1)

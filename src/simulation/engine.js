@@ -42,50 +42,77 @@ const DRAFT_CONE_HALF_ANGLE = Math.PI / 6  // demi-angle 30°
 // considère une cassure : ils ne sont plus dans le même groupe.
 const GROUP_GAP_THRESHOLD_M = 25
 
-// ─── IA comportementale (Bloc B — TDD/GDD v0.5 §12.2) ───────────────────────
-// États de la machine IA. EXPLODED et RECOVERING priment sur la décision de
-// profil ; ATTACKING se maintient jusqu'à quasi-épuisement du W' (hystérésis,
-// évite le flip-flop tick par tick).
-export const AI_STATES = {
-  FOLLOWING:  'following',
-  ATTACKING:  'attacking',
-  EXPLODED:   'exploded',
-  RECOVERING: 'recovering',
-}
-
-// Seuils de réserve W' (fraction du max) pour les transitions d'état.
-const WPRIME_RECOVER_ENTER = 0.15  // sous ce seuil → RECOVERING (Éco forcé)
-const WPRIME_RECOVER_EXIT  = 0.40  // au-dessus → sortie de RECOVERING
-const WPRIME_ATTACK_EXIT   = 0.15  // sous ce seuil → fin d'attaque (RECOVERING)
+// ─── IA — Raisonnement par couches (IA Couches v0.1) ────────────────────────
+// La couche 1 modélise le COUREUR SEUL : il n'a AUCUNE conscience des autres
+// coureurs. Son raisonnement aboutit à une ZONE D'EFFORT CIBLE (1-6), que le
+// moteur traduit ensuite en puissance puis en vitesse. La machine d'état
+// FOLLOWING/ATTACKING/RECOVERING (ex-Bloc B P0) est retirée au profit de ce
+// modèle continu fondé sur le budget de réserve. Voir IA_Couches_v0_1.
 
 // Nombre maximum d'entrées conservées dans rider.aiLog (B1 — fiche coureur).
-// Une entrée par CHANGEMENT d'état/mode (pas par tick) : reste lisible même
+// Une entrée par CHANGEMENT de zone cible (pas par tick) : reste lisible même
 // sur une longue course. Les plus anciennes sont évincées (FIFO).
 export const AI_LOG_MAX_ENTRIES = 20
 
-// Profils IA — stratégie d'effort selon le terrain (TDD v0.5 §12.2).
-// equipier : "calque sur le leader d'équipe" nécessite un modèle d'équipe
-// (team_id / leader_id) non encore présent dans le schéma roster — en
-// attendant, comportement prudent type rouleur, sans initiative d'attaque
-// (seuil d'attaque "Jamais", conforme à la table v0.5).
-export const AI_PROFILES = {
-  grimpeur: {
-    climbGradientMin:  2,     // % — au-delà : terrain de montée pour ce profil
-    attackGradientMin: 5,     // % — gradient minimum pour tenter une attaque
-    attackWPrimeMin:   0.60,  // W' minimum pour tenter une attaque
-  },
-  rouleur: {
-    climbGradientMin:  2,
-    attackGradientMax: 2,     // attaque seulement sur plat / faux-plat
-    attackWPrimeMin:   0.70,
-  },
-  sprinteur: {
-    maintienDistM: 2000,      // bascule en Maintien dans les 2 derniers km
-    sprintDistM:   500,       // attaque (Z5/Z6) dans les 500 derniers m
-  },
-  equipier: {
-    climbGradientMin: 2,
-  },
+// Facteur FTP central de chaque zone — utilisé pour traduire une zone cible
+// (joueur OU IA) en puissance. Valeur représentative au milieu de la plage
+// ftpMin..ftpMax de ZONES. Z6 borné à une valeur d'attaque soutenable.
+export const ZONE_FTP_TARGET = { 1: 0.50, 2: 0.65, 3: 0.83, 4: 0.98, 5: 1.13, 6: 1.30 }
+
+// ─── Profils amateurs (IA Couches v0.1 §5, valeurs abaissées vs pro) ────────
+// Un profil n'est PAS une logique « si grimpeur alors… » : les comportements
+// émergent du bouquet (W/kg, W', plafond anaérobie, enduranceFactor). Valeurs
+// de niveau amateur (FTP ~245-270 W, W/kg ~3.0-3.7) — moddables.
+//   mass  : kg (coureur + vélo)         maxAnaero : W (plafond 5-15 s)
+//   ftp   : W (seuil ~1 h)              wPrimeJ   : J (taille du réservoir)
+//   enduranceFactor : 0-1 (freine la recharge de wBalance + fraîcheur longue)
+export const AMATEUR_PROFILES = {
+  grimpeur: { mass: 66, ftp: 245, wPrimeJ: 11000, maxAnaerobicPower: 650,  enduranceFactor: 0.88 },
+  rouleur:  { mass: 78, ftp: 270, wPrimeJ: 16000, maxAnaerobicPower: 750,  enduranceFactor: 0.86 },
+  puncheur: { mass: 74, ftp: 255, wPrimeJ: 18000, maxAnaerobicPower: 850,  enduranceFactor: 0.80 },
+  sprinteur:{ mass: 84, ftp: 250, wPrimeJ: 22000, maxAnaerobicPower: 1050, enduranceFactor: 0.74 },
+}
+
+// Amplitude de la variation individuelle (±%) appliquée à chaque caractéristique
+// pour qu'aucun coureur d'un même profil ne soit interchangeable avec un autre.
+const PROFILE_JITTER = 0.06
+
+// PRNG déterministe (mulberry32) — pour que le jitter soit reproductible à
+// partir d'une graine stable (l'id du coureur), donc des courses rejouables.
+function _seededRng(seedStr) {
+  let h = 1779033703 ^ String(seedStr).length
+  for (let i = 0; i < String(seedStr).length; i++) {
+    h = Math.imul(h ^ String(seedStr).charCodeAt(i), 3432918353)
+    h = (h << 13) | (h >>> 19)
+  }
+  let a = h >>> 0
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+/**
+ * Construit les caractéristiques individuelles d'un coureur à partir de son
+ * profil amateur, avec une variation reproductible (graine = seed).
+ *
+ * @param {string} profileName - clé de AMATEUR_PROFILES
+ * @param {string} seed        - graine du jitter (typiquement rider.id)
+ * @returns {{mass,ftpWatts,wPrimeJ,maxAnaerobicPower,enduranceFactor}}
+ */
+export function makeRiderProfile(profileName, seed = 'seed') {
+  const base = AMATEUR_PROFILES[profileName] ?? AMATEUR_PROFILES.rouleur
+  const rng = _seededRng(`${seed}:${profileName}`)
+  const jit = () => 1 + (rng() * 2 - 1) * PROFILE_JITTER
+  return {
+    mass:             Math.round(base.mass * jit()),
+    ftpWatts:         Math.round(base.ftp * jit()),
+    wPrimeJ:          Math.round(base.wPrimeJ * jit()),
+    maxAnaerobicPower:Math.round(base.maxAnaerobicPower * jit()),
+    enduranceFactor:  Math.min(0.98, Math.max(0.6, base.enduranceFactor * jit())),
+  }
 }
 
 // ─── Zones d'effort ─────────────────────────────────────────────────────────
@@ -98,10 +125,11 @@ export const ZONES = {
   Z6: { id: 6, name: 'Sprint',       ftpMin: 1.21, ftpMax: 9.99, color: '#dc2626', label: 'Z6' },
 }
 
-// ─── Modes POC → zones cibles ───────────────────────────────────────────────
-// Note : 'attaque' à 1.15 FTP soutenu donne Z5 (effort prolongé d'attaque).
-// Le Z6 ponctuel relève de l'action 'Sprinter' (déclenchement unique, Phase 1),
-// pas d'un mode d'effort continu.
+// ─── Modes POC → zones cibles (LEGACY — conservé pour C1/actionToZone) ──────
+// Les modes Éco/Maintien/Attaque ne pilotent plus l'effort courant : le joueur
+// comme l'IA visent désormais une ZONE cible (rider.targetZone, 1-6). Ces
+// entrées restent utilisées par actionToZone()/projectCost() (C1) comme
+// raccourcis d'« actions » projetables au survol du HUD.
 export const EFFORT_MODES = {
   eco:      { label: 'Éco',     ftpFactor: 0.65, zone: ZONES.Z2, color: '#34d399' },
   maintien: { label: 'Maintien',ftpFactor: 0.85, zone: ZONES.Z3, color: '#fbbf24' },
@@ -123,19 +151,35 @@ export function createRider(overrides = {}) {
     lateralOffset: 0.8,     // joueur légèrement à droite du centre
     targetWheel: null,
     ellipse: { long: 2.5, lat: 0.8 },
+    // Profil physiologique — constantes individuelles (IA Couches v0.1 §2.1).
+    // mass est le levier des bosses ; wPrimeJ/maxAnaerobicPower/enduranceFactor
+    // distinguent les profils sans logique « si grimpeur alors… ».
+    profile: {
+      mass: 75,
+      ftpWatts: 280,
+      wPrimeJ: 25000,
+      maxAnaerobicPower: 900,
+      enduranceFactor: 0.86,
+    },
     // Énergie
     energy: {
-      endurance:  { current: 3600, max: 3600 },
+      // Endurance — grande jauge « tenir des heures ». Dimensionnée pour une
+      // étape longue (≥ 50 km) : ne se vide pas sur une seule course en
+      // croisière Z2-Z3 (explosion réservée aux excès soutenus). IA Couches §4.
+      endurance:  { current: 9000, max: 9000 },
+      // wPrime = réserve anaérobie (W'). current = wBalance (jauge courante).
       wPrime:     { current: 25000, max: 25000 },
       zone:       2,
       ftpWatts:   280,
       exploded:   false,      // explosion Endurance — irréversible sur la course
       wFailTicks: 0,          // ticks restants de défaillance W' (crampe locale)
+      freshness:  1.0,        // fraîcheur générale (1.0 → ~0.85), module la recharge
       dayFormMod: 1.0,
     },
     // État courant
     speedKmh: 0,
-    effortMode: 'maintien',
+    targetZone: 3,            // zone d'effort cible (1-6) — joueur ET IA
+    effortMode: 'maintien',  // LEGACY — conservé pour compat HUD/projection
     distanceTravelled: 0,
     screenCount: 0,        // écrans devant dans le cône (Bloc A) — calculé par la boucle
     // B1 — fiche coureur : journal des changements de décision IA
@@ -147,26 +191,31 @@ export function createRider(overrides = {}) {
 }
 
 /**
- * Crée un coureur IA avec un profil simple.
- * L'IA roule à puissance constante (effortMode fixe, pas d'input joueur).
+ * Crée un coureur IA avec un profil amateur.
+ * L'IA raisonne en couche 1 (decideTargetZone) : coureur seul, sans conscience
+ * des autres. Sa zone cible est recalculée chaque tick (anti-girouette).
  */
 export function createAIRider(overrides = {}) {
+  const profileName = overrides.aiProfile ?? 'rouleur'
+  const prof = makeRiderProfile(profileName, overrides.id ?? 'rider_ai_001')
   return createRider({
     id: 'rider_ai_001',
     name: 'Lucas Ferrer',
     isPlayer: false,
-    aiState: AI_STATES.FOLLOWING,
+    aiProfile: profileName,
     lateralOffset: -0.8,    // côté gauche de la route
+    profile: prof,
     energy: {
-      endurance:  { current: 3600, max: 3600 },
-      wPrime:     { current: 25000, max: 25000 },
+      endurance:  { current: 9000, max: 9000 },
+      wPrime:     { current: prof.wPrimeJ, max: prof.wPrimeJ },
       zone:       2,
-      ftpWatts:   265,       // légèrement plus faible que le joueur
+      ftpWatts:   prof.ftpWatts,
       exploded:   false,
       wFailTicks: 0,
+      freshness:  1.0,
       dayFormMod: 1.0,
     },
-    effortMode: 'maintien',
+    targetZone: 2,
     ...overrides,
   })
 }
@@ -197,24 +246,34 @@ export function createRidersFromRoster(roster, opts = {}) {
     const lateralOffset = (i % 2 === 0 ? 1 : -1) * 0.4 * (isPlayer ? 1 : 1)
 
     const make = isPlayer ? createRider : createAIRider
+    const profileName = isPlayer ? null : (entry.aiProfile ?? 'rouleur')
+    // Joueur : profil dérivé de son FTP roster (pas de jitter) ; IA : profil
+    // amateur du type, avec variation individuelle reproductible (graine = id).
+    const prof = isPlayer
+      ? { mass: 75, ftpWatts: entry.ftpWatts ?? 280, wPrimeJ: 25000, maxAnaerobicPower: 900, enduranceFactor: 0.86 }
+      : makeRiderProfile(profileName, entry.id ?? `rider_${i}`)
+
     return make({
       id:   entry.id   ?? `rider_${String(i).padStart(3, '0')}`,
       name: entry.name ?? `Coureur ${i + 1}`,
       isPlayer,
       role: entry.role ?? 'allrounder',
-      aiProfile: isPlayer ? null : (entry.aiProfile ?? 'rouleur'),
+      aiProfile: profileName,
       splinePos,
       renderPos: splinePos,
       lateralOffset,
+      profile: prof,
       energy: {
-        endurance:  { current: 3600, max: 3600 },
-        wPrime:     { current: 25000, max: 25000 },
+        endurance:  { current: 9000, max: 9000 },
+        wPrime:     { current: prof.wPrimeJ, max: prof.wPrimeJ },
         zone:       2,
-        ftpWatts:   entry.ftpWatts ?? 280,
+        ftpWatts:   prof.ftpWatts,
         exploded:   false,
         wFailTicks: 0,
+        freshness:  1.0,
         dayFormMod: 1.0,
       },
+      targetZone: isPlayer ? 3 : 2,
       effortMode: isPlayer ? 'maintien' : 'eco',
     })
   })
@@ -230,9 +289,13 @@ export function createRidersFromRoster(roster, opts = {}) {
  * @param {number} windKmh
  * @param {number} draftFactor - multiplicateur de CdA ∈ ]0,1] (1 = pas d'abri).
  *                               Vaut 1 - draftReduction(). Réduit la traînée aéro.
+ * @param {number} massKg - masse coureur+vélo (défaut PHYSICS.mass). Levier des
+ *                          bosses : c'est par cette masse que le profil grimpeur
+ *                          (léger) prend l'avantage en montée (W/kg).
  */
-export function computeSpeed(powerWatts, gradientPercent, windKmh = 0, draftFactor = 1) {
-  const { rho, g, Crr, mass } = PHYSICS
+export function computeSpeed(powerWatts, gradientPercent, windKmh = 0, draftFactor = 1, massKg = PHYSICS.mass) {
+  const { rho, g, Crr } = PHYSICS
+  const mass = massKg ?? PHYSICS.mass
   const CdA = (Math.abs(gradientPercent) > 3 ? PHYSICS.CdA_climb : PHYSICS.CdA_flat) * draftFactor
   const gradient = gradientPercent / 100
   const vWind = windKmh / 3.6
@@ -473,214 +536,149 @@ export function getNextDecisiveMoment(rider, route) {
   return (candidate && candidate.distanceM < finish.distanceM) ? candidate : finish
 }
 
-// ─── IA comportementale — décision d'effort (Bloc B) ────────────────────────
-/**
- * Détermine si `rider` doit tenter une attaque selon son profil
- * (TDD/GDD v0.5 §12.2 — colonne "Seuil d'attaque").
- *
- * @returns {boolean}
- */
-export function shouldAttack(rider, gradient, distanceToFinish, wRatio) {
-  const profile = AI_PROFILES[rider.aiProfile]
-  if (!profile) return false
-  switch (rider.aiProfile) {
-    case 'grimpeur':
-      return gradient >= profile.attackGradientMin && wRatio >= profile.attackWPrimeMin
-    case 'rouleur':
-      return gradient <= profile.attackGradientMax && wRatio >= profile.attackWPrimeMin
-    case 'sprinteur':
-      return distanceToFinish <= profile.sprintDistM
-    case 'equipier':
-    default:
-      return false // "Seuil d'attaque : Jamais" (TDD v0.5 §12.2)
-  }
-}
+// ─── IA — Couche 1 : le coureur seul (IA Couches v0.1) ──────────────────────
+// Le raisonnement aboutit à une ZONE D'EFFORT CIBLE (1-6). Aucune conscience
+// des autres coureurs (c'est l'objet des couches 2+). Recalculé chaque tick
+// mais stabilisé contre l'effet « girouette » (hystérésis + engagement min).
 
-/**
- * Mode d'effort « de croisière » (état FOLLOWING) selon profil et terrain
- * (TDD/GDD v0.5 §12.2 — colonnes "Stratégie montée" / "descente-plat").
- *
- * @returns {'eco'|'maintien'}
- */
-export function baseEffortMode(rider, gradient, distanceToFinish) {
-  const profile = AI_PROFILES[rider.aiProfile]
-  if (!profile) return 'maintien'
-  switch (rider.aiProfile) {
-    case 'grimpeur':
-      // Maintien en montée (son terrain), Éco ailleurs (garde les jambes pour le col)
-      return gradient >= profile.climbGradientMin ? 'maintien' : 'eco'
-    case 'rouleur':
-    case 'equipier':
-      // Éco en montagne (pas leur terrain), Maintien sur plat / faux-plat
-      return gradient >= profile.climbGradientMin ? 'eco' : 'maintien'
-    case 'sprinteur':
-      // Éco jusqu'aux 2 derniers km, puis Maintien pour se replacer avant le sprint
-      return distanceToFinish <= profile.maintienDistM ? 'maintien' : 'eco'
-    default:
-      return 'maintien'
-  }
-}
-
-// ─── B1 — Journal de raisonnement IA (fiche coureur) ────────────────────────
 // Formate une fraction en pourcentage entier pour les messages de raisonnement.
 const _pct = (ratio) => Math.round(ratio * 100)
 
-/**
- * Explication lisible d'une tentative d'attaque réussie (shouldAttack === true),
- * miroir de shouldAttack() pour chaque profil — TDD/GDD v0.5 §12.2.
- */
-function _attackReason(rider, gradient, distanceToFinish, wRatio) {
-  const profile = AI_PROFILES[rider.aiProfile]
-  switch (rider.aiProfile) {
-    case 'grimpeur':
-      return `Attaque (grimpeur) : pente ${gradient.toFixed(1)}% ≥ seuil ${profile.attackGradientMin}%, `
-        + `W' ${_pct(wRatio)}% ≥ seuil ${_pct(profile.attackWPrimeMin)}%.`
-    case 'rouleur':
-      return `Attaque (rouleur) : pente ${gradient.toFixed(1)}% ≤ seuil plat ${profile.attackGradientMax}%, `
-        + `W' ${_pct(wRatio)}% ≥ seuil ${_pct(profile.attackWPrimeMin)}%.`
-    case 'sprinteur':
-      return `Attaque (sprinteur) : sprint final, ${Math.round(distanceToFinish)}m ≤ ${profile.sprintDistM}m de l'arrivée.`
-    default:
-      return `Attaque (${rider.aiProfile}).`
-  }
+// Anti-girouette — seuils de wBalance (fraction du max) encadrant les montées
+// de zone. On DESCEND de zone dès qu'on passe sous _LOW (sécurité, immédiat),
+// mais on ne REMONTE qu'au-dessus de _HIGH : la bande morte tue l'oscillation.
+const WBAL_DROP_BELOW = 0.15   // sous ce niveau → cap forcé à la baisse
+const WBAL_RAISE_ABOVE = 0.40  // au-dessus → autorisé à viser plus haut à nouveau
+// Engagement minimum : une zone choisie est tenue ce nombre de ticks (s) avant
+// qu'une nouvelle MONTÉE de zone soit permise (une baisse d'urgence passe outre).
+const ZONE_COMMIT_TICKS = 5
+
+// Plafond de zone selon la masse en montée : plus lourd = plafond plus bas.
+// (IA Couches v0.1 §9.1 — « on plafonne selon mass »).
+function _massClimbZoneCap(mass) {
+  if (mass >= 82) return 4   // gabarit lourd : pas au-delà du seuil en montée
+  if (mass >= 74) return 5
+  return 6                   // léger : peut monter en VO2max/sprint sur la bosse
 }
 
 /**
- * Explication lisible du mode de croisière choisi par baseEffortMode(),
- * miroir de sa logique pour chaque profil — TDD/GDD v0.5 §12.2.
- */
-function _followingReason(rider, gradient, distanceToFinish, mode) {
-  const profile = AI_PROFILES[rider.aiProfile]
-  const modeLabel = EFFORT_MODES[mode]?.label ?? mode
-  switch (rider.aiProfile) {
-    case 'grimpeur':
-      return gradient >= profile.climbGradientMin
-        ? `Suivi (grimpeur) : pente ${gradient.toFixed(1)}% ≥ ${profile.climbGradientMin}% → ${modeLabel} (terrain favorable).`
-        : `Suivi (grimpeur) : pente ${gradient.toFixed(1)}% < ${profile.climbGradientMin}% → ${modeLabel} (garde les jambes pour la montée).`
-    case 'rouleur':
-    case 'equipier':
-      return gradient >= profile.climbGradientMin
-        ? `Suivi (${rider.aiProfile}) : pente ${gradient.toFixed(1)}% ≥ ${profile.climbGradientMin}% → ${modeLabel} (montagne, pas son terrain).`
-        : `Suivi (${rider.aiProfile}) : pente ${gradient.toFixed(1)}% < ${profile.climbGradientMin}% → ${modeLabel} (plat/faux-plat, son terrain).`
-    case 'sprinteur':
-      return distanceToFinish <= profile.maintienDistM
-        ? `Suivi (sprinteur) : ${Math.round(distanceToFinish)}m de l'arrivée ≤ ${profile.maintienDistM}m → ${modeLabel} (se replace avant le sprint).`
-        : `Suivi (sprinteur) : ${Math.round(distanceToFinish)}m de l'arrivée > ${profile.maintienDistM}m → ${modeLabel} (économise).`
-    default:
-      return `Suivi (${rider.aiProfile}) → ${modeLabel}.`
-  }
-}
-
-/**
- * Ajoute une entrée au journal de raisonnement (rider.aiLog) si l'aiState ou
- * l'effortMode change — ou s'il s'agit de la toute première décision. Évite
- * le bruit d'une entrée par tick en régime stable (B1 — fiche coureur).
+ * Décide la ZONE d'effort cible d'un coureur seul (couche 1).
+ * Mute rider.targetZone et rider.aiState (libellé lisible), consigne dans
+ * rider.aiLog si la zone change. No-op pour le joueur (il choisit sa zone).
  *
- * @param {Object} rider
- * @param {number|null} simSec - horodatage simulé (context.simSec)
- * @param {string} aiState
- * @param {string} effortMode
- * @param {string} reason
+ * Logique (IA Couches v0.1 §9.1) :
+ *  1. Zone de base selon le temps : Z2 si loin de l'arrivée, Z3 en approche.
+ *  2. Modulation pente : en montée on s'autorise +1 zone, plafonné par mass.
+ *  3. Garde-fou prospectif : W' réparti sur les bosses restantes (climbsAhead)
+ *     → on cape si beaucoup de montées restent (« pas tout sur la première »).
+ *  4. Autorisation de puiser : si ça redescend juste après, on tolère Z4/Z5.
+ *  5. Bornage wBalance : réserve basse → cap à Z3/Z2 (la réserve se recharge).
+ *  + Filtre anti-girouette (hystérésis + engagement minimum).
+ *
+ * @param {Object} rider   - coureur IA (rider.aiProfile non null ; sinon no-op)
+ * @param {Object} route   - expose getGradientAt, totalLength, segments
+ * @param {Object} context - { simSec } horodatage simulé (B1, optionnel)
+ * @returns {number} zone cible (1-6)
  */
-function _logAiDecision(rider, simSec, aiState, effortMode, reason) {
+export function decideTargetZone(rider, route, context = {}) {
+  // Joueur : pas de décision IA, il pilote sa propre zone.
+  if (!rider.aiProfile) return rider.targetZone
+
+  const { simSec } = context
+  const energy = rider.energy
+  const prof = rider.profile ?? {}
+  const mass = prof.mass ?? 75
+  const wBal = energy.wPrime.current / energy.wPrime.max
+  const gradient = route?.getGradientAt ? route.getGradientAt(rider.splinePos) : 0
+  const totalLength = route?.totalLength ?? Infinity
+  const distanceToFinish = Number.isFinite(totalLength)
+    ? Math.max(0, totalLength - rider.splinePos)
+    : Infinity
+
+  // 1. Zone de base (plat / faux-plat) — bornée par le temps restant.
+  //    En approche de l'arrivée (< 2 km), plus rien à garder → Z3.
+  let zone = distanceToFinish <= 2000 ? 3 : 2
+  let reason
+
+  // 2. Modulation par la pente : tenir la vitesse en montée coûte cher → +1 zone.
+  const climbCap = _massClimbZoneCap(mass)
+  if (gradient >= 2) {
+    zone = Math.min(zone + 1, climbCap)
+    // 4. Autorisation de puiser dans W' : si ça redescend/s'aplanit juste après
+    //    (à ~200 m), on tolère une zone de plus pour finir la bosse.
+    const aheadPos = Math.min(totalLength, rider.splinePos + 200)
+    const gradientAhead = route?.getGradientAt ? route.getGradientAt(aheadPos) : gradient
+    if (gradientAhead < gradient - 1 && wBal > WBAL_RAISE_ABOVE) {
+      zone = Math.min(zone + 1, climbCap)
+    }
+    reason = `Montée ${gradient.toFixed(1)}% → vise Z${zone} (plafond masse Z${climbCap}, ${mass}kg).`
+  } else if (gradient <= -3) {
+    // Descente : inutile de forcer, on récupère.
+    zone = Math.min(zone, 2)
+    reason = `Descente ${gradient.toFixed(1)}% → récup en Z${zone}.`
+  } else {
+    reason = `Plat/faux-plat → Z${zone} (arrivée à ${(distanceToFinish/1000).toFixed(1)} km).`
+  }
+
+  // 3. Garde-fou prospectif : répartir W' sur les bosses restantes.
+  //    Beaucoup de montées encore à venir → on cape pour ne pas tout donner.
+  const climbsAhead = (typeof upcomingClimbs === 'function' && route?.segments)
+    ? upcomingClimbs(route, rider.splinePos).length : 0
+  if (climbsAhead >= 2 && zone >= 5) {
+    zone = 4
+    reason += ` ${climbsAhead} bosses restantes → cap Z4 (je ne donne pas tout sur la première).`
+  }
+
+  // 5. Bornage dynamique par wBalance (réserve disponible) — sécurité immédiate.
+  if (wBal < WBAL_DROP_BELOW) {
+    zone = Math.min(zone, energy.exploded ? 1 : 2)
+    reason = `Réserve W' basse (${_pct(wBal)}%) → cap Z${zone}, la réserve se recharge.`
+  } else if (energy.exploded) {
+    zone = 1
+    reason = `Explosion Endurance → Z1 forcé (irréversible).`
+  }
+
+  // ── Filtre anti-girouette ──────────────────────────────────────────────
+  const prev = rider.targetZone ?? zone
+  const lastChange = rider._zoneCommitSec ?? -Infinity
+  const committedFor = (simSec ?? 0) - lastChange
+  if (zone > prev) {
+    // Monter de zone : exige hystérésis (réserve au-dessus du seuil haut) ET
+    // engagement minimum tenu. Sinon on reste sur la zone précédente.
+    const allowed = wBal >= WBAL_RAISE_ABOVE && committedFor >= ZONE_COMMIT_TICKS
+    if (!allowed) {
+      zone = prev
+      reason = `Maintien Z${zone} (anti-girouette : hystérésis/engagement non franchis).`
+    }
+  }
+  // Une baisse de zone est toujours permise (sécurité W').
+
+  if (zone !== prev) rider._zoneCommitSec = simSec ?? 0
+
+  rider.targetZone = zone
+  // aiState : libellé lisible dérivé de la zone (pour la fiche coureur B1).
+  rider.aiState = zone >= 5 ? 'effort_fort' : zone >= 3 ? 'soutenu' : 'economie'
+  _logZoneDecision(rider, simSec, zone, reason)
+  return zone
+}
+
+// Journal B1 : une entrée par CHANGEMENT de zone cible (pas par tick).
+function _logZoneDecision(rider, simSec, zone, reason) {
   if (!rider.aiLog) rider.aiLog = []
   const last = rider.aiLog[rider.aiLog.length - 1]
-  const changed = !last || last.aiState !== aiState || last.effortMode !== effortMode
-  if (changed) {
-    rider.aiLog.push({ simSec: simSec ?? null, aiState, effortMode, reason })
+  if (!last || last.zone !== zone) {
+    rider.aiLog.push({ simSec: simSec ?? null, zone, aiState: rider.aiState, reason })
     if (rider.aiLog.length > AI_LOG_MAX_ENTRIES) rider.aiLog.shift()
   }
 }
 
 /**
- * Mute rider.aiState, consigne la décision dans rider.aiLog (si changement),
- * et renvoie l'effortMode — point de sortie unique de aiDecide().
- */
-function _decide(rider, simSec, aiState, effortMode, reason) {
-  rider.aiState = aiState
-  _logAiDecision(rider, simSec, aiState, effortMode, reason)
-  return effortMode
-}
-
-/**
- * Décision d'effort IA pour un tick (TDD/GDD v0.5 §12.2).
- * Mute `rider.aiState` (et consigne dans `rider.aiLog`, B1) et renvoie le
- * nouvel `effortMode`.
- *
- * Ordre de priorité :
- *  1. EXPLODED   — Endurance à 0, état terminal pour la course → Éco
- *  2. ATTACKING  — tient jusqu'à quasi-épuisement du W' (hystérésis)
- *  3. RECOVERING — Éco forcé jusqu'à reconstitution du W' (sauf sprint final)
- *  4. Tentative d'attaque selon le profil → ATTACKING
- *  5. FOLLOWING  — effort de base selon profil et terrain
- *
- * @param {Object} rider   - coureur IA (rider.aiProfile non null ; sinon no-op)
- * @param {Object} context - { route, simSec } — route expose getGradientAt(splinePos)
- *                            et totalLength ; simSec = horodatage simulé (B1, optionnel)
- * @returns {string} effortMode ('eco' | 'maintien' | 'attaque')
+ * Compat : ancien point d'entrée de l'IA. Délègue à decideTargetZone() et
+ * renvoie la zone cible (le moteur traduit zone → puissance dans simulateTick).
+ * @returns {number} zone cible
  */
 export function aiDecide(rider, context = {}) {
-  // Coureur joueur : aucune décision IA, on laisse son effortMode tel quel —
-  // et pas de journal (la "fiche coureur" du joueur n'a pas de raisonnement IA).
-  if (!rider.aiProfile) return rider.effortMode
-
-  const { route, simSec } = context
-  const energy = rider.energy
-  const wRatio = energy.wPrime.current / energy.wPrime.max
-  const gradient = route?.getGradientAt ? route.getGradientAt(rider.splinePos) : 0
-  const distanceToFinish = route?.totalLength != null
-    ? Math.max(0, route.totalLength - rider.splinePos)
-    : Infinity
-
-  const sprintCfg = AI_PROFILES.sprinteur
-  const isFinalSprint = rider.aiProfile === 'sprinteur' && distanceToFinish <= sprintCfg.sprintDistM
-
-  // 1. Explosion — irréversible sur la course
-  if (energy.exploded) {
-    return _decide(rider, simSec, AI_STATES.EXPLODED, 'eco',
-      `Endurance épuisée → explosion (irréversible), Éco forcé.`)
-  }
-
-  // 2. Attaque en cours : on tient jusqu'à épuisement quasi-total du W'
-  if (rider.aiState === AI_STATES.ATTACKING) {
-    if (wRatio < WPRIME_ATTACK_EXIT) {
-      return _decide(rider, simSec, AI_STATES.RECOVERING, 'eco',
-        `Fin d'attaque : W' ${_pct(wRatio)}% < seuil de sortie ${_pct(WPRIME_ATTACK_EXIT)}% → récupération (Éco).`)
-    }
-    return _decide(rider, simSec, AI_STATES.ATTACKING, 'attaque',
-      `Attaque maintenue : W' ${_pct(wRatio)}% ≥ seuil de sortie ${_pct(WPRIME_ATTACK_EXIT)}% (hystérésis).`)
-  }
-
-  // 3. Récupération : priorité, sauf sprint final (dernière carte malgré tout)
-  // transitionNote : mémorise pourquoi on sort de RECOVERING, pour l'ajouter
-  // au raisonnement de l'étape suivante (4 ou 5) qui détermine le mode réel.
-  let transitionNote = null
-  if (rider.aiState === AI_STATES.RECOVERING) {
-    if (wRatio >= WPRIME_RECOVER_EXIT) {
-      transitionNote = `Sortie de récupération : W' ${_pct(wRatio)}% ≥ seuil ${_pct(WPRIME_RECOVER_EXIT)}%.`
-    } else if (isFinalSprint) {
-      transitionNote = `Sprint final malgré récupération (W' ${_pct(wRatio)}%) — tente sa chance.`
-    } else {
-      return _decide(rider, simSec, AI_STATES.RECOVERING, 'eco',
-        `Récupération en cours : W' ${_pct(wRatio)}% < seuil de sortie ${_pct(WPRIME_RECOVER_EXIT)}% → Éco forcé.`)
-    }
-  } else if (wRatio < WPRIME_RECOVER_ENTER && !isFinalSprint) {
-    return _decide(rider, simSec, AI_STATES.RECOVERING, 'eco',
-      `Réserve W' faible : ${_pct(wRatio)}% < seuil d'entrée en récupération ${_pct(WPRIME_RECOVER_ENTER)}% → Éco forcé.`)
-  }
-
-  // 4. Tentative d'attaque selon le profil
-  if (shouldAttack(rider, gradient, distanceToFinish, wRatio)) {
-    const reason = _attackReason(rider, gradient, distanceToFinish, wRatio)
-    return _decide(rider, simSec, AI_STATES.ATTACKING, 'attaque',
-      transitionNote ? `${transitionNote} ${reason}` : reason)
-  }
-
-  // 5. Suivi normal
-  const mode = baseEffortMode(rider, gradient, distanceToFinish)
-  const reason = _followingReason(rider, gradient, distanceToFinish, mode)
-  return _decide(rider, simSec, AI_STATES.FOLLOWING, mode,
-    transitionNote ? `${transitionNote} ${reason}` : reason)
+  return decideTargetZone(rider, context.route, context)
 }
 
 
@@ -703,11 +701,15 @@ export function applyEnergy(rider, powerWatts, dtSec = 1) {
     // Zones aérobies : consomme Endurance lentement
     const rate = ENDURANCE_AEROBIC_RATES[zone] ?? ENDURANCE_AEROBIC_RATES[1]
     energy.endurance.current = Math.max(0, energy.endurance.current - rate * dtSec)
-    // Récupération W' passive
+    // Récupération W' passive — modulée par enduranceFactor × freshness
+    // (IA Couches v0.1 §8 : un coureur « cuit » recharge sa cartouche au ralenti).
     if (energy.wPrime.current < energy.wPrime.max) {
+      const endF = rider.profile?.enduranceFactor ?? 1
+      const fresh = energy.freshness ?? 1
+      const recovery = WPRIME_RECOVERY_RATE * endF * fresh
       energy.wPrime.current = Math.min(
         energy.wPrime.max,
-        energy.wPrime.current + WPRIME_RECOVERY_RATE * dtSec
+        energy.wPrime.current + recovery * dtSec
       )
     }
   } else {
@@ -726,6 +728,12 @@ export function applyEnergy(rider, powerWatts, dtSec = 1) {
   // Explosion Endurance
   if (energy.endurance.current <= 0) {
     energy.exploded = true
+  }
+
+  // Fraîcheur générale : décroît lentement avec le temps cumulé (IA Couches
+  // v0.1 §8). 1.0 au départ → ~0.85 après ~1h. Plancher à 0.80.
+  if (energy.freshness != null) {
+    energy.freshness = Math.max(0.80, energy.freshness - 0.000045 * dtSec)
   }
 }
 
@@ -830,7 +838,7 @@ export function projectCost(action, rider, route, distanceToNextKeyPoint) {
   const effectivePower = powerTarget * draftFactor
   const zone = getZoneFromFtpRatio(effectivePower / energy.ftpWatts)
 
-  const speedKmh = computeSpeed(effectivePower, currentGradient, 0, draftFactor)
+  const speedKmh = computeSpeed(effectivePower, currentGradient, 0, draftFactor, rider.profile?.mass)
   const speedMs  = speedKmh / 3.6
   const durationSec = speedMs > 0 ? distanceToNextKeyPoint / speedMs : 0
 
@@ -853,11 +861,13 @@ export function projectCost(action, rider, route, distanceToNextKeyPoint) {
  * @param {number} dtSec - durée du tick en secondes simulées
  */
 export function simulateTick(rider, route, dtSec = 1) {
-  const mode = EFFORT_MODES[rider.effortMode] ?? EFFORT_MODES.maintien
   const { energy } = rider
 
-  // Puissance cible selon mode et état
-  let powerWatts = mode.ftpFactor * energy.ftpWatts * energy.dayFormMod
+  // Puissance cible selon la ZONE cible (joueur ou IA — même chemin).
+  // zone → facteur FTP central (ZONE_FTP_TARGET) → watts.
+  const zone = rider.targetZone ?? 3
+  const ftpFactor = ZONE_FTP_TARGET[zone] ?? ZONE_FTP_TARGET[3]
+  let powerWatts = ftpFactor * energy.ftpWatts * energy.dayFormMod
   if (energy.exploded) powerWatts = energy.ftpWatts * 0.55
 
   // Défaillance W' (crampe) : puissance bridée pendant N ticks, puis récupération
@@ -875,8 +885,10 @@ export function simulateTick(rider, route, dtSec = 1) {
   const draft = draftReduction(rider.screenCount ?? 0, rider.speedKmh)
   const draftFactor = 1 - draft
 
-  // Vitesse
-  const speedKmh = computeSpeed(powerWatts, gradient, 0, draftFactor)
+  // Vitesse — masse réelle du coureur (levier des bosses : un grimpeur léger
+  // grimpe plus vite à watts égaux).
+  const massKg = rider.profile?.mass ?? PHYSICS.mass
+  const speedKmh = computeSpeed(powerWatts, gradient, 0, draftFactor, massKg)
   rider.speedKmh = speedKmh
 
   // Avancement sur la spline (m)

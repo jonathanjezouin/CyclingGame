@@ -263,7 +263,7 @@ export class GameRenderer {
       this._drawRiderShape(entry.gfx, rider)
 
       // Cône d'aspiration (debug)
-      if (this._showCones) this._drawCone(rider, px)
+      if (this._showCones) this._drawCone(rider, px, { x: entry.gfx.x, y: entry.gfx.y })
 
       if (rider.id === followedRiderId) followedPx = px
     }
@@ -330,10 +330,17 @@ export class GameRenderer {
    * @param {Object} rider - doit porter rider.screenCount
    * @param {{x,y,rotation}} px - position pixel et orientation du coureur
    */
-  _drawCone(rider, px) {
+  _drawCone(rider, px, spritePos) {
     const entry = this._cones.get(rider.id)
     if (!entry) return
     const { cone, label } = entry
+
+    // Ancrer le cône sur la position RENDUE du sprite (qui suit son propre lerp
+    // visuel ×0.25), pas sur px brut : sinon, à vitesse de simulation élevée, le
+    // sprite est à la traîne de px et le cône s'en détache. On garde l'orientation
+    // de px (tangente à la route au point courant).
+    const cx = spritePos ? spritePos.x : px.x
+    const cy = spritePos ? spritePos.y : px.y
 
     const dist = CONE_DIST_M * SCALE
     // Le cône d'abri s'étend vers l'arrière : direction opposée au cap.
@@ -343,21 +350,21 @@ export class GameRenderer {
 
     cone.clear()
     cone.beginFill(0x34d399, 0.07)
-    cone.moveTo(px.x, px.y)
+    cone.moveTo(cx, cy)
     const ARC_STEPS = 8
     for (let i = 0; i <= ARC_STEPS; i++) {
       const a = aLeft + (aRight - aLeft) * (i / ARC_STEPS)
-      cone.lineTo(px.x + Math.cos(a) * dist, px.y + Math.sin(a) * dist)
+      cone.lineTo(cx + Math.cos(a) * dist, cy + Math.sin(a) * dist)
     }
-    cone.lineTo(px.x, px.y)
+    cone.lineTo(cx, cy)
     cone.endFill()
 
     // Label : nombre d'écrans captés par CE coureur (debug, exact)
     const sc = rider.screenCount ?? 0
     label.visible = sc > 0
     label.text = sc > 0 ? `${sc}` : ''
-    label.x = px.x
-    label.y = px.y - 14
+    label.x = cx
+    label.y = cy - 14
   }
 
   // ─── Caméra ────────────────────────────────────────────────────────────────

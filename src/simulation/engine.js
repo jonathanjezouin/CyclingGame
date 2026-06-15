@@ -463,6 +463,50 @@ export function upcomingFlats(route, fromSplinePos) {
   return _upcomingSegments(route, fromSplinePos, FLAT_SEGMENT_TYPES)
 }
 
+// Écart maximal (m) entre deux segments de montée pour qu'ils soient considérés
+// comme UNE SEULE ascension. Couvre les replats/faux-plats d'approche : un
+// faux-plat de 2% suivi d'un mur à 7% est une seule ascension pour le coureur,
+// pas deux bosses. Au-delà de ce seuil (vraie descente, longue section plate),
+// ce sont des ascensions distinctes.
+const ASCENT_MERGE_GAP_M = 2500
+
+/**
+ * Regroupe les segments de montée (climb/hc_climb) contigus — ou séparés par un
+ * court intervalle (≤ ASCENT_MERGE_GAP_M) — en ASCENSIONS logiques uniques.
+ * Une ascension = { from, to, lengthM } couvrant tout l'ensemble.
+ *
+ * C'est la granularité « difficulté » telle que la perçoit un coureur : le
+ * faux-plat d'approche et le mur qui suit forment un seul objectif (le sommet),
+ * pas deux bosses comptées séparément.
+ *
+ * @param {Object} route - expose `segments`
+ * @returns {Array<{from:number,to:number,lengthM:number}>} ascensions triées
+ */
+export function ascents(route) {
+  const climbs = (route?.segments ?? [])
+    .filter(s => CLIMB_SEGMENT_TYPES.includes(s.type))
+    .sort((a, b) => a.from - b.from)
+  const merged = []
+  for (const seg of climbs) {
+    const last = merged[merged.length - 1]
+    if (last && seg.from - last.to <= ASCENT_MERGE_GAP_M) {
+      last.to = seg.to   // prolonge l'ascension en cours
+    } else {
+      merged.push({ from: seg.from, to: seg.to })
+    }
+  }
+  return merged.map(a => ({ ...a, lengthM: a.to - a.from }))
+}
+
+/**
+ * Ascensions (fusionnées) à venir depuis `fromSplinePos` — celle en cours
+ * incluse si le coureur est dedans. Sert au garde-fou prospectif (combien de
+ * difficultés majeures restent) et au budget de montée.
+ */
+export function upcomingAscents(route, fromSplinePos) {
+  return ascents(route).filter(a => a.to > fromSplinePos)
+}
+
 /**
  * Écart (m) entre le coureur `rider` et le groupe situé juste devant le sien.
  * Dérivé de `groups` (sortie de updateGroups, triée de l'avant vers l'arrière).
@@ -574,13 +618,13 @@ function _massClimbZoneCap(mass) {
   return 6                   // léger : peut monter en VO2max/sprint sur la bosse
 }
 
-// Distance restante (m) jusqu'au sommet de la montée EN COURS (le coureur est
-// dedans), ou null s'il n'est pas sur un segment de montée. Sert au calcul de
-// budget : « quelle intensité puis-je tenir jusqu'en haut sans exploser ? ».
+// Distance restante (m) jusqu'au sommet de l'ASCENSION en cours (segments de
+// montée fusionnés — faux-plat d'approche + mur comptent comme un seul objectif),
+// ou null si le coureur n'est pas dans une montée. Sert au budget d'effort :
+// « quelle intensité puis-je tenir jusqu'au sommet sans exploser ? ».
 function _remainingClimbM(route, splinePos) {
-  const seg = (route?.segments ?? []).find(s =>
-    CLIMB_SEGMENT_TYPES.includes(s.type) && splinePos >= s.from && splinePos < s.to)
-  return seg ? (seg.to - splinePos) : null
+  const asc = ascents(route).find(a => splinePos >= a.from && splinePos < a.to)
+  return asc ? (asc.to - splinePos) : null
 }
 
 /**
@@ -667,13 +711,15 @@ export function decideTargetZone(rider, route, context = {}) {
     reason = `Plat/faux-plat → Z${zone} (arrivée à ${(distanceToFinish/1000).toFixed(1)} km).`
   }
 
-  // 3. Garde-fou prospectif : répartir W' sur les bosses restantes.
-  //    Beaucoup de montées encore à venir → on cape pour ne pas tout donner.
-  const climbsAhead = (typeof upcomingClimbs === 'function' && route?.segments)
-    ? upcomingClimbs(route, rider.splinePos).length : 0
-  if (climbsAhead >= 2 && zone >= 5) {
+  // 3. Garde-fou prospectif : ne pas tout donner si d'AUTRES ascensions
+  //    majeures restent APRÈS celle en cours. On compte les ascensions
+  //    fusionnées dont le sommet est encore devant, en excluant celle où l'on
+  //    se trouve (un faux-plat + mur = une seule ascension, pas deux).
+  const ascentsAhead = upcomingAscents(route, rider.splinePos)
+    .filter(a => !(rider.splinePos >= a.from && rider.splinePos < a.to))
+  if (ascentsAhead.length >= 1 && zone >= 5) {
     zone = 4
-    reason += ` ${climbsAhead} bosses restantes → cap Z4 (je ne donne pas tout sur la première).`
+    reason += ` ${ascentsAhead.length} ascension(s) après → cap Z4 (je garde pour la suite).`
   }
 
   // 5. Bornage dynamique par wBalance (réserve disponible) — sécurité immédiate.

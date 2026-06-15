@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   decideTargetZone,
+  decidePowerTarget,
   aiDecide,
   makeRiderProfile,
   AMATEUR_PROFILES,
@@ -115,10 +116,12 @@ describe('decideTargetZone — zone de base par terrain', () => {
     expect(p.aiLog).toEqual([])
   })
 
-  it('plat, loin de l\'arrivée → Z2 (bornée par le temps)', () => {
+  it('plat, loin de l\'arrivée → intensité d\'endurance modérée', () => {
     const r = mkRider('rouleur', { splinePos: 0 })
-    const z = decideTargetZone(r, mkRoute({ gradient: 0, totalLength: 50000 }), { simSec: 0 })
-    expect(z).toBe(2)
+    r.speedKmh = 35
+    decidePowerTarget(r, mkRoute({ gradient: 0, totalLength: 50000 }), { simSec: 0 })
+    expect(r.powerFrac).toBeLessThan(0.90)
+    expect(r.powerFrac).toBeGreaterThan(0.40)
   })
 
   it('plat, en approche de l\'arrivée (< 2 km) → Z3', () => {
@@ -127,10 +130,12 @@ describe('decideTargetZone — zone de base par terrain', () => {
     expect(z).toBe(3)
   })
 
-  it('montée → monte d\'au moins une zone vs le plat', () => {
-    const flat = decideTargetZone(mkRider('grimpeur'), mkRoute({ gradient: 0 }), { simSec: 0 })
-    const climb = decideTargetZone(mkRider('grimpeur'), mkRoute({ gradient: 6 }), { simSec: 0 })
-    expect(climb).toBeGreaterThan(flat)
+  it('montée → intensité plus haute que sur le plat', () => {
+    const flatR = mkRider('grimpeur'); flatR.speedKmh = 35
+    const climbR = mkRider('grimpeur'); climbR.speedKmh = 16; climbR._zoneCommitSec = -100
+    decidePowerTarget(flatR, mkRoute({ gradient: 0 }), { simSec: 0 })
+    decidePowerTarget(climbR, mkRoute({ gradient: 6 }), { simSec: 1000 })
+    expect(climbR.powerFrac).toBeGreaterThan(flatR.powerFrac)
   })
 
   it('descente → ne force pas, récupère (≤ Z2)', () => {
@@ -171,11 +176,11 @@ describe('decideTargetZone — garde-fou prospectif (climbsAhead)', () => {
 })
 
 describe('decideTargetZone — bornage par wBalance (réserve)', () => {
-  it('réserve très basse → cap à Z2, peu importe le terrain', () => {
+  it('réserve W\' très basse → repasse sous le seuil pour recharger', () => {
     const r = mkRider('grimpeur', { wRatio: 0.10 })
-    r._zoneCommitSec = -100
-    const z = decideTargetZone(r, mkRoute({ gradient: 8 }), { simSec: 1000 })
-    expect(z).toBeLessThanOrEqual(2)
+    r._zoneCommitSec = -100; r.speedKmh = 14
+    decidePowerTarget(r, mkRoute({ gradient: 8 }), { simSec: 1000 })
+    expect(r.powerFrac).toBeLessThanOrEqual(0.85)
   })
 
   it('explosion Endurance → Z1 forcé', () => {
@@ -186,16 +191,14 @@ describe('decideTargetZone — bornage par wBalance (réserve)', () => {
 })
 
 describe('decideTargetZone — anti-girouette', () => {
-  it('ne monte pas de zone tant que l\'engagement minimum n\'est pas tenu', () => {
+  it('la hausse d\'intensité est lissée (amortie), pas instantanée', () => {
     const r = mkRider('grimpeur', { wRatio: 1.0, splinePos: 0 })
-    // Établit un changement de zone récent (commit à simSec 5) : montée vers Z3
-    r._zoneCommitSec = -100
-    decideTargetZone(r, mkRoute({ gradient: 3 }), { simSec: 5 }) // monte, commit=5
-    const zAfterClimb = r.targetZone
-    expect(zAfterClimb).toBeGreaterThan(2)
-    // 2 s plus tard (< 5 s d'engagement), une pente plus forte ne fait pas remonter
-    const z = decideTargetZone(r, mkRoute({ gradient: 9 }), { simSec: 7 })
-    expect(z).toBe(zAfterClimb)
+    r.speedKmh = 16; r._zoneCommitSec = -100
+    r.powerFrac = 0.65
+    // Une grosse pente vise haut, mais on ne saute pas d'un coup à la cible.
+    decidePowerTarget(r, mkRoute({ gradient: 8 }), { simSec: 1000 })
+    expect(r.powerFrac).toBeGreaterThan(0.65)   // a monté
+    expect(r.powerFrac).toBeLessThan(1.13)      // mais pas d'un bond jusqu'au plafond
   })
 
   it('autorise la montée une fois l\'engagement tenu et la réserve haute', () => {
@@ -205,16 +208,16 @@ describe('decideTargetZone — anti-girouette', () => {
     expect(z).toBeGreaterThan(2)
   })
 
-  it('une baisse de zone est toujours immédiate (sécurité W\')', () => {
+  it('la baisse d\'intensité est immédiate (sécurité W\')', () => {
     const r = mkRider('grimpeur', { wRatio: 1.0, splinePos: 0 })
-    r._zoneCommitSec = -100
-    decideTargetZone(r, mkRoute({ gradient: 8 }), { simSec: 1000 })
-    const high = r.targetZone
-    expect(high).toBeGreaterThan(2)
-    // Réserve s'effondre : la baisse s'applique tout de suite, sans engagement
+    r.speedKmh = 16; r._zoneCommitSec = -100
+    for (let i = 0; i < 20; i++) decidePowerTarget(r, mkRoute({ gradient: 8 }), { simSec: 1000 + i })
+    const high = r.powerFrac
+    expect(high).toBeGreaterThan(0.95)
+    // Réserve s'effondre : la baisse s'applique tout de suite (pas de lissage)
     r.energy.wPrime.current = 0.05 * r.energy.wPrime.max
-    const z = decideTargetZone(r, mkRoute({ gradient: 8 }), { simSec: 1001 })
-    expect(z).toBeLessThan(high)
+    decidePowerTarget(r, mkRoute({ gradient: 8 }), { simSec: 1020 })
+    expect(r.powerFrac).toBeLessThan(high)
   })
 })
 
@@ -242,12 +245,14 @@ describe('decideTargetZone — journal de raisonnement (rider.aiLog, B1)', () =>
     expect(r.aiLog).toHaveLength(1)
   })
 
-  it('nouvelle entrée quand la zone change', () => {
+  it('nouvelle entrée quand la phase de course change', () => {
     const r = mkRider('grimpeur', { wRatio: 1.0, splinePos: 0 })
-    decideTargetZone(r, mkRoute({ gradient: 0 }), { simSec: 0 })   // Z2
-    decideTargetZone(r, mkRoute({ gradient: 6 }), { simSec: 10 })  // monte
+    r.speedKmh = 30
+    decidePowerTarget(r, mkRoute({ gradient: 0 }), { simSec: 0 })   // plat
+    r.speedKmh = 16
+    decidePowerTarget(r, mkRoute({ gradient: 6 }), { simSec: 10 })  // montée
     expect(r.aiLog.length).toBeGreaterThanOrEqual(2)
-    expect(r.aiLog[r.aiLog.length - 1].zone).not.toBe(r.aiLog[0].zone)
+    expect(r.aiLog[r.aiLog.length - 1].reason).not.toBe(r.aiLog[0].reason)
   })
 
   it('le journal est plafonné à AI_LOG_MAX_ENTRIES (FIFO)', () => {
@@ -329,32 +334,34 @@ describe('Énergie continue & budget de montée (v1.2)', () => {
   })
 
   it('Endurance : un effort plus intense draine plus vite (P/FTP)²', () => {
-    const easy = createRider({ targetZone: 2 })
-    const hard = createRider({ targetZone: 4 })
+    const easy = createRider({ powerFrac: 0.65 })
+    const hard = createRider({ powerFrac: 0.98 })
     for (let i = 0; i < 30; i++) { simulateTick(easy, mkRoute({ gradient: 0 }), 1); simulateTick(hard, mkRoute({ gradient: 0 }), 1) }
     const dEasy = easy.energy.endurance.max - easy.energy.endurance.current
     const dHard = hard.energy.endurance.max - hard.energy.endurance.current
     expect(dHard).toBeGreaterThan(dEasy)
   })
 
-  it('sur une longue HC, un grimpeur léger puise dans W\' (zone ≥ 5 possible)', () => {
+  it('sur une longue HC, un grimpeur léger pousse au-dessus du seuil (powerFrac > 1)', () => {
     const segments = [{ from: 0, to: 12000, type: 'hc_climb' }]
     const route = { getGradientAt: () => 7, totalLength: 12000, segments }
     const grimpeur = createAIRider({ aiProfile: 'grimpeur', splinePos: 2000 })
-    grimpeur.speedKmh = 15
+    grimpeur.profile.mass = 64
+    grimpeur.speedKmh = 16
     grimpeur._zoneCommitSec = -100
-    decideTargetZone(grimpeur, route, { simSec: 1000 })
-    expect(grimpeur.targetZone).toBeGreaterThanOrEqual(4)
+    // plusieurs ticks pour laisser le lissage monter vers la cible
+    for (let i = 0; i < 30; i++) decidePowerTarget(grimpeur, route, { simSec: 1000 + i })
+    expect(grimpeur.powerFrac).toBeGreaterThan(1.0)
   })
 
-  it('sur la même HC, un sprinteur lourd est plafonné plus bas qu\'un grimpeur', () => {
+  it('sur la même HC, un coureur lourd plafonne plus bas qu\'un léger', () => {
     const segments = [{ from: 0, to: 12000, type: 'hc_climb' }]
     const route = { getGradientAt: () => 7, totalLength: 12000, segments }
-    const grimpeur = createAIRider({ aiProfile: 'grimpeur', splinePos: 2000 })
-    const sprinteur = createAIRider({ aiProfile: 'sprinteur', splinePos: 2000 })
-    for (const r of [grimpeur, sprinteur]) { r.speedKmh = 14; r._zoneCommitSec = -100 }
-    decideTargetZone(grimpeur, route, { simSec: 1000 })
-    decideTargetZone(sprinteur, route, { simSec: 1000 })
-    expect(sprinteur.targetZone).toBeLessThanOrEqual(grimpeur.targetZone)
+    const leger = createAIRider({ aiProfile: 'grimpeur', splinePos: 2000 })
+    const lourd = createAIRider({ aiProfile: 'sprinteur', splinePos: 2000 })
+    leger.profile.mass = 64; lourd.profile.mass = 86
+    for (const r of [leger, lourd]) { r.speedKmh = 15; r._zoneCommitSec = -100 }
+    for (let i = 0; i < 30; i++) { decidePowerTarget(leger, route, { simSec: 1000+i }); decidePowerTarget(lourd, route, { simSec: 1000+i }) }
+    expect(lourd.powerFrac).toBeLessThanOrEqual(leger.powerFrac)
   })
 })

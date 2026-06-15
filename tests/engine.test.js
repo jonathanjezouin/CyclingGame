@@ -173,8 +173,8 @@ describe('simulateTick — avancement', () => {
     expect(r.splinePos).toBeLessThanOrEqual(5)
   })
 
-  it('zone cible 5 place le coureur en Z5', () => {
-    const r = createRider({ targetZone: 5 })
+  it('powerFrac pilote la puissance : 1.13 FTP place en Z5', () => {
+    const r = createRider({ powerFrac: 1.13 })
     simulateTick(r, flatRoute, 1)
     expect(r.energy.zone).toBe(5)
   })

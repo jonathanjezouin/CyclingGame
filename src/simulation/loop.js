@@ -6,7 +6,7 @@
  *   rider.renderPos = position interpolée à afficher (mis à jour à 60 FPS)
  *   rider.splinePos = position simulée (mis à jour par ticks discrets)
  */
-import { simulateTick, updateGroups, computeScreenCount, decideTargetZone } from './engine.js'
+import { simulateTick, updateGroups, computeScreenCount, decidePowerTarget } from './engine.js'
 
 export class SimulationLoop {
   /**
@@ -86,10 +86,10 @@ export class SimulationLoop {
 
           for (const rider of this.riders) {
             // Couche 1 : décision de ZONE cible avant le tick (joueur exclu —
-            // il pilote sa propre zone via le HUD). decideTargetZone mute
+            // il pilote sa propre zone via le HUD). decidePowerTarget mute
             // rider.targetZone et le journal de raisonnement (B1).
             if (!rider.isPlayer) {
-              decideTargetZone(rider, this.route, { simSec: this.elapsedSimSec })
+              decidePowerTarget(rider, this.route, { simSec: this.elapsedSimSec })
             }
             this._interp[rider.id].before = rider.splinePos
             simulateTick(rider, this.route, 1)

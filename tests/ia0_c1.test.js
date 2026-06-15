@@ -231,7 +231,9 @@ describe('projectCost', () => {
     expect(result.wPrimePct).toBeLessThan(0) // "W' stable" / récupère
 
     // Cohérence interne avec les helpers
-    const expectedEndurance = computeEnduranceDrain(0, 3, result.durationSec) / rider.energy.endurance.max
+    // Cohérence : la projection utilise le modèle continu (FTP en 4e arg).
+    const powerTarget = 0.85 * rider.energy.ftpWatts * (rider.energy.dayFormMod ?? 1)
+    const expectedEndurance = computeEnduranceDrain(powerTarget, 3, result.durationSec, rider.energy.ftpWatts) / rider.energy.endurance.max
     expect(result.endurancePct).toBeCloseTo(expectedEndurance, 6)
   })
 

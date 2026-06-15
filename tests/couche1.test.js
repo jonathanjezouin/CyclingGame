@@ -321,3 +321,40 @@ describe('enduranceFactor — module la recharge de wBalance (§8)', () => {
     expect(r.energy.freshness).toBeLessThan(f0)
   })
 })
+
+// ─── v1.2 : coût énergie continu + gestion de budget en montée ──────────────
+describe('Énergie continue & budget de montée (v1.2)', () => {
+  const mkRoute = ({ gradient = 0, totalLength = 50000, segments = [] } = {}) => ({
+    getGradientAt: () => gradient, totalLength, segments,
+  })
+
+  it('Endurance : un effort plus intense draine plus vite (P/FTP)²', () => {
+    const easy = createRider({ targetZone: 2 })
+    const hard = createRider({ targetZone: 4 })
+    for (let i = 0; i < 30; i++) { simulateTick(easy, mkRoute({ gradient: 0 }), 1); simulateTick(hard, mkRoute({ gradient: 0 }), 1) }
+    const dEasy = easy.energy.endurance.max - easy.energy.endurance.current
+    const dHard = hard.energy.endurance.max - hard.energy.endurance.current
+    expect(dHard).toBeGreaterThan(dEasy)
+  })
+
+  it('sur une longue HC, un grimpeur léger puise dans W\' (zone ≥ 5 possible)', () => {
+    const segments = [{ from: 0, to: 12000, type: 'hc_climb' }]
+    const route = { getGradientAt: () => 7, totalLength: 12000, segments }
+    const grimpeur = createAIRider({ aiProfile: 'grimpeur', splinePos: 2000 })
+    grimpeur.speedKmh = 15
+    grimpeur._zoneCommitSec = -100
+    decideTargetZone(grimpeur, route, { simSec: 1000 })
+    expect(grimpeur.targetZone).toBeGreaterThanOrEqual(4)
+  })
+
+  it('sur la même HC, un sprinteur lourd est plafonné plus bas qu\'un grimpeur', () => {
+    const segments = [{ from: 0, to: 12000, type: 'hc_climb' }]
+    const route = { getGradientAt: () => 7, totalLength: 12000, segments }
+    const grimpeur = createAIRider({ aiProfile: 'grimpeur', splinePos: 2000 })
+    const sprinteur = createAIRider({ aiProfile: 'sprinteur', splinePos: 2000 })
+    for (const r of [grimpeur, sprinteur]) { r.speedKmh = 14; r._zoneCommitSec = -100 }
+    decideTargetZone(grimpeur, route, { simSec: 1000 })
+    decideTargetZone(sprinteur, route, { simSec: 1000 })
+    expect(sprinteur.targetZone).toBeLessThanOrEqual(grimpeur.targetZone)
+  })
+})

@@ -95,11 +95,21 @@ describe('applyEnergy — réservoirs', () => {
     expect(r.energy.wPrime.current).toBeGreaterThanOrEqual(w0) // recharge ou stable
   })
 
-  it('Z5 vide W\' rapidement', () => {
+  it('au-dessus du FTP, W\' se vide proportionnellement a l\'exces', () => {
     const r = createRider()
     const w0 = r.energy.wPrime.current
-    applyEnergy(r, 1.13 * r.energy.ftpWatts, 1) // Z5 → 200 J/s
-    expect(w0 - r.energy.wPrime.current).toBeGreaterThan(150)
+    const ftp = r.energy.ftpWatts
+    applyEnergy(r, 1.5 * ftp, 1)
+    expect(w0 - r.energy.wPrime.current).toBeCloseTo(0.5 * ftp, 0)
+  })
+
+  it('un effort plus intense vide W\' plus vite (continuite)', () => {
+    const ftp = createRider().energy.ftpWatts
+    const a = createRider(); applyEnergy(a, 1.2 * ftp, 1)
+    const b = createRider(); applyEnergy(b, 1.6 * ftp, 1)
+    const dA = a.energy.wPrime.max - a.energy.wPrime.current
+    const dB = b.energy.wPrime.max - b.energy.wPrime.current
+    expect(dB).toBeGreaterThan(dA)
   })
 
   it('recharge W\' passive en zone aérobie quand W\' entamé', () => {

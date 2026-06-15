@@ -259,19 +259,29 @@ export function createRidersFromRoster(roster, opts = {}) {
     const lateralOffset = (i % 2 === 0 ? 1 : -1) * 0.4 * (isPlayer ? 1 : 1)
 
     const make = isPlayer ? createRider : createAIRider
-    const profileName = isPlayer ? null : (entry.aiProfile ?? 'rouleur')
-    // Joueur : profil dérivé de son FTP roster (pas de jitter) ; IA : profil
-    // amateur du type, avec variation individuelle reproductible (graine = id).
-    const prof = isPlayer
-      ? { mass: 75, ftpWatts: entry.ftpWatts ?? 280, wPrimeJ: 25000, maxAnaerobicPower: 900, enduranceFactor: 0.86 }
-      : makeRiderProfile(profileName, entry.id ?? `rider_${i}`)
+
+    // Caractéristiques : priorité aux valeurs EN DUR du roster (mass, ftpWatts,
+    // wPrimeJ, maxAnaerobicPower, enduranceFactor). Si une valeur manque, on
+    // retombe sur le profil amateur (aiProfile, optionnel) ou des défauts.
+    const fallback = entry.aiProfile
+      ? makeRiderProfile(entry.aiProfile, entry.id ?? `rider_${i}`)
+      : { mass: 75, ftpWatts: 260, wPrimeJ: 16000, maxAnaerobicPower: 800, enduranceFactor: 0.84 }
+    const prof = {
+      mass:              entry.mass              ?? fallback.mass,
+      ftpWatts:          entry.ftpWatts          ?? fallback.ftpWatts,
+      wPrimeJ:           entry.wPrimeJ           ?? fallback.wPrimeJ,
+      maxAnaerobicPower: entry.maxAnaerobicPower ?? fallback.maxAnaerobicPower,
+      enduranceFactor:   entry.enduranceFactor   ?? fallback.enduranceFactor,
+    }
 
     return make({
       id:   entry.id   ?? `rider_${String(i).padStart(3, '0')}`,
       name: entry.name ?? `Coureur ${i + 1}`,
       isPlayer,
       role: entry.role ?? 'allrounder',
-      aiProfile: profileName,
+      // aiProfile conservé seulement s'il est fourni (plus requis) — pour
+      // l'instant tous les coureurs partagent le même raisonnement couche 1.
+      aiProfile: isPlayer ? null : (entry.aiProfile ?? 'coureur'),
       splinePos,
       renderPos: splinePos,
       lateralOffset,

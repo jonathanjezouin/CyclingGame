@@ -8,7 +8,7 @@
       :dsMessage="dsMessage"
       :currentTimeScale="timeScale"
       :paused="paused"
-      @setTargetZone="setTargetZone"
+      @setPowerFrac="setPowerFrac"
       @dsAction="handleDsAction"
       @setTimeScale="setTimeScale"
       @togglePause="togglePause"
@@ -39,7 +39,7 @@
         <div class="track-info" v-if="track">
           <div class="track-name">{{ track.name }}</div>
           <div class="track-meta">{{ track.distance_km }} km · {{ track.type }} · {{ riders.length }} coureurs</div>
-          <div class="track-hint">Molette : zoom · Espace : pause · C : cônes · ← → : changer de coureur suivi</div>
+          <div class="track-hint">Molette : zoom · Espace : pause · C : cônes · ← → : coureur suivi · ↑ ↓ : intensité</div>
         </div>
         <button class="start-btn" @click="startRace">Démarrer la course</button>
       </div>
@@ -84,7 +84,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import HUD from './ui/HUD.vue'
 import RiderCard from './ui/RiderCard.vue'
 import AltimetricProfile from './ui/AltimetricProfile.vue'
-import { createRider, createAIRider, createRidersFromRoster } from './simulation/engine.js'
+import { createRider, createAIRider, createRidersFromRoster, getZoneFromFtpRatio } from './simulation/engine.js'
 import { SimulationLoop } from './simulation/loop.js'
 import { CatmullRomSpline } from './render/spline.js'
 import { GameRenderer } from './render/renderer.js'
@@ -227,9 +227,12 @@ function startRace() {
 }
 
 // ─── Contrôles ───────────────────────────────────────────────────────────────
-function setTargetZone(zone) {
+function setPowerFrac(frac) {
   const p = riders.value.find(r => r.isPlayer)
-  if (p) p.targetZone = zone
+  if (p) {
+    p.powerFrac = frac
+    p.targetZone = getZoneFromFtpRatio(frac)   // zone dérivée (affichage)
+  }
 }
 
 function setTimeScale(scale) {

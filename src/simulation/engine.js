@@ -637,7 +637,8 @@ const _pct = (ratio) => Math.round(ratio * 100)
 // Anti-girouette — seuils de wBalance (fraction du max) encadrant les montées
 // de zone. On DESCEND de zone dès qu'on passe sous _LOW (sécurité, immédiat),
 // mais on ne REMONTE qu'au-dessus de _HIGH : la bande morte tue l'oscillation.
-const WBAL_DROP_BELOW = 0.15   // sous ce niveau → cap forcé à la baisse
+const WBAL_DROP_BELOW = 0.15   // sous ce niveau → entre en récupération W' (latché)
+const WBAL_RECOVER_EXIT = 0.30 // ne sort de récupération qu'au-dessus (hystérésis)
 const WBAL_RAISE_ABOVE = 0.40  // au-dessus → autorisé à viser plus haut à nouveau
 // Engagement minimum : une zone choisie est tenue ce nombre de ticks (s) avant
 // qu'une nouvelle MONTÉE de zone soit permise (une baisse d'urgence passe outre).
@@ -791,25 +792,36 @@ export function decidePowerTarget(rider, route, context = {}) {
   }
 
   // ── Sécurité W' / explosion (prioritaire) ───────────────────────────────
+  // Hystérésis sur la récupération W' : on ENTRE en récup sous WBAL_DROP_BELOW
+  // (15%) et on n'en SORT qu'au-dessus de WBAL_RECOVER_EXIT (30%). Sans cette
+  // bande morte, lever le pied remontait aussitôt le W' au-dessus de 15%, donc
+  // on repartait à fond au tick suivant, qui le revidait… → oscillation
+  // 113%→80%→113% par seconde. Le flag latché transforme ça en un vrai cycle
+  // « je me mets en dedans / je récupère / je repars » de plusieurs secondes.
   if (energy.exploded) {
     target = 0.50
+    rider._recoveringW = false
     reason = `Explosion Endurance → ${Math.round(target*100)}% FTP forcé (irréversible).`
-  } else if (wBal < WBAL_DROP_BELOW) {
-    // Réserve quasi vide : on repasse SOUS le seuil pour la recharger.
-    target = Math.min(target, 0.80)
-    reason = `Réserve W' basse (${_pct(wBal)}%) → ${Math.round(target*100)}% FTP, on recharge.`
+  } else {
+    if (wBal < WBAL_DROP_BELOW) rider._recoveringW = true
+    else if (wBal >= WBAL_RECOVER_EXIT) rider._recoveringW = false
+    if (rider._recoveringW) {
+      target = Math.min(target, 0.80)
+      reason = `Réserve W' basse (${_pct(wBal)}%) → ${Math.round(target*100)}% FTP, je récupère jusqu'à ${Math.round(WBAL_RECOVER_EXIT*100)}%.`
+    }
   }
 
   // ── Lissage temporel (anti-girouette continu) ───────────────────────────
-  // Plus besoin de paliers/hystérésis de zone : on lisse la fraction vers la
-  // cible. La hausse est amortie (on ne saute pas brutalement), la BAISSE est
-  // immédiate (sécurité : si on doit lever le pied, on le fait tout de suite).
+  // On lisse la fraction vers la cible. La hausse est amortie (montée
+  // progressive de l'effort). La baisse est plus rapide mais PAS instantanée :
+  // un lissage descendant évite les à-coups (le claquement 113%→80% vu au log)
+  // tout en restant réactif pour la sécurité.
   const prev = rider.powerFrac ?? target
   let next
   if (target >= prev) {
-    next = prev + (target - prev) * POWER_SMOOTH   // montée amortie
+    next = prev + (target - prev) * POWER_SMOOTH_UP    // montée douce
   } else {
-    next = target                                  // baisse immédiate
+    next = prev + (target - prev) * POWER_SMOOTH_DOWN  // baisse rapide mais lissée
   }
 
   rider.powerFrac = next
@@ -828,10 +840,12 @@ function _massPowerCeil(mass) {
   return 1.18 + (0.98 - 1.18) * t
 }
 
-// Coefficient de lissage de la HAUSSE d'intensité par tick (la baisse est
-// immédiate). 0.15 ≈ ~5 s pour résorber l'essentiel d'un saut — assez réactif
-// pour suivre le terrain, assez doux pour éviter l'effet girouette.
-const POWER_SMOOTH = 0.15
+// Coefficients de lissage de l'intensité par tick. La HAUSSE est douce (montée
+// progressive de l'effort) ; la BAISSE est plus rapide mais pas instantanée
+// (réactive pour la sécurité, sans claquement). ~0.15 ≈ 5 s pour l'essentiel
+// d'un saut à la hausse ; ~0.35 ≈ 2 s à la baisse.
+const POWER_SMOOTH_UP = 0.15
+const POWER_SMOOTH_DOWN = 0.35
 
 // Journal B1 : une entrée quand la RAISON change (changement de phase de
 // course), pas à chaque micro-ajustement de fraction.

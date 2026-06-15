@@ -140,7 +140,9 @@ describe('decideTargetZone — zone de base par terrain', () => {
 
   it('descente → ne force pas, récupère (≤ Z2)', () => {
     const r = mkRider('rouleur')
-    const z = decideTargetZone(r, mkRoute({ gradient: -5 }), { simSec: 0 })
+    // Le lissage descendant converge en quelques ticks (transition non instantanée).
+    let z
+    for (let i = 0; i < 15; i++) z = decideTargetZone(r, mkRoute({ gradient: -5 }), { simSec: i })
     expect(z).toBeLessThanOrEqual(2)
   })
 })
@@ -185,7 +187,8 @@ describe('decideTargetZone — bornage par wBalance (réserve)', () => {
 
   it('explosion Endurance → Z1 forcé', () => {
     const r = mkRider('rouleur', { exploded: true, wRatio: 0.05 })
-    const z = decideTargetZone(r, mkRoute({ gradient: 0 }), { simSec: 0 })
+    let z
+    for (let i = 0; i < 15; i++) z = decideTargetZone(r, mkRoute({ gradient: 0 }), { simSec: i })
     expect(z).toBe(1)
   })
 })
@@ -363,5 +366,56 @@ describe('Énergie continue & budget de montée (v1.2)', () => {
     for (const r of [leger, lourd]) { r.speedKmh = 15; r._zoneCommitSec = -100 }
     for (let i = 0; i < 30; i++) { decidePowerTarget(leger, route, { simSec: 1000+i }); decidePowerTarget(lourd, route, { simSec: 1000+i }) }
     expect(lourd.powerFrac).toBeLessThanOrEqual(leger.powerFrac)
+  })
+})
+
+// ─── Anti-oscillation : hystérésis de récupération W' (fix changement_rythmes) ─
+describe('Hystérésis de récupération W\' (anti-girouette)', () => {
+  const mkClimb = () => ({
+    getGradientAt: () => 7, totalLength: 12000,
+    segments: [{ from: 0, to: 12000, type: 'hc_climb' }],
+  })
+
+  it('ne re-pousse pas dès que W\' repasse 15% : reste en récup jusqu\'à 30%', () => {
+    const r = createAIRider({ aiProfile: 'grimpeur', splinePos: 2000 })
+    r.profile.mass = 64
+    r.speedKmh = 16
+    r._zoneCommitSec = -100
+    // Réserve sous le seuil d'entrée → entre en récupération
+    r.energy.wPrime.current = 0.12 * r.energy.wPrime.max
+    decidePowerTarget(r, mkClimb(), { simSec: 1000 })
+    expect(r._recoveringW).toBe(true)
+    const pRecover = r.powerFrac
+    // W' remonte juste au-dessus de 15% (mais < 30%) : on NE repart PAS à fond
+    r.energy.wPrime.current = 0.18 * r.energy.wPrime.max
+    decidePowerTarget(r, mkClimb(), { simSec: 1001 })
+    expect(r._recoveringW).toBe(true)        // toujours en récup (hystérésis)
+    expect(r.powerFrac).toBeLessThanOrEqual(pRecover + 0.05)  // pas de bond à fond
+  })
+
+  it('sort de récup seulement au-dessus de 30%', () => {
+    const r = createAIRider({ aiProfile: 'grimpeur', splinePos: 2000 })
+    r.profile.mass = 64; r.speedKmh = 16; r._zoneCommitSec = -100
+    r.energy.wPrime.current = 0.10 * r.energy.wPrime.max
+    decidePowerTarget(r, mkClimb(), { simSec: 1000 })
+    expect(r._recoveringW).toBe(true)
+    r.energy.wPrime.current = 0.35 * r.energy.wPrime.max
+    decidePowerTarget(r, mkClimb(), { simSec: 1001 })
+    expect(r._recoveringW).toBe(false)       // au-dessus de 30% → on peut repartir
+  })
+
+  it('la transition d\'effort est lissée, jamais un saut brutal (>15% en 1 tick)', () => {
+    const r = createAIRider({ aiProfile: 'grimpeur', splinePos: 2000 })
+    r.profile.mass = 64; r.speedKmh = 16; r._zoneCommitSec = -100
+    let prev = r.powerFrac ?? 0.83
+    let maxJump = 0
+    for (let i = 0; i < 60; i++) {
+      // Alterne réserve haute/basse pour provoquer l'oscillation d'avant
+      r.energy.wPrime.current = (i % 10 < 5 ? 0.12 : 0.5) * r.energy.wPrime.max
+      decidePowerTarget(r, mkClimb(), { simSec: 1000 + i })
+      maxJump = Math.max(maxJump, Math.abs(r.powerFrac - prev))
+      prev = r.powerFrac
+    }
+    expect(maxJump).toBeLessThan(0.15)   // aucun claquement 113%→80% par tick
   })
 })

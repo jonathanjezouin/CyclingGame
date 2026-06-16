@@ -45,6 +45,11 @@ export class GameRenderer {
     this._cones   = new Map()   // riderId → { gfx, label }
     this._showCones = false     // toggle debug (touche 'C')
 
+    // Caméra : suivi temporisé indépendant du framerate.
+    this._lastFollowedId = null   // pour détecter un changement de coureur suivi
+    this._lastCamPx = null        // dernière position pixel suivie (recentrage zoom)
+    this._lastFrameMs = null      // horodatage frame précédente (calcul du dt)
+
     this._setupZoom(canvasEl)
   }
 
@@ -53,7 +58,20 @@ export class GameRenderer {
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault()
       const factor = e.deltaY < 0 ? 1.1 : 0.91
-      this._zoom = Math.max(0.2, Math.min(8.0, this._zoom * factor))
+      const newZoom = Math.max(0.2, Math.min(8.0, this._zoom * factor))
+      // Zoom centré sur le coureur suivi : on garde sa position écran fixe
+      // pendant le changement d'échelle (sinon le monde « saute » car
+      // world.x/y avaient été calculés pour l'ancien zoom).
+      const anchor = this._lastCamPx
+      if (anchor) {
+        // Position écran de l'ancre avant zoom = world + anchor*zoom.
+        const screenX = this.world.x + anchor.x * this._zoom
+        const screenY = this.world.y + anchor.y * this._zoom
+        // On veut qu'après zoom, l'ancre reste au même point écran.
+        this.world.x = screenX - anchor.x * newZoom
+        this.world.y = screenY - anchor.y * newZoom
+      }
+      this._zoom = newZoom
       this.world.scale.set(this._zoom)
     }, { passive: false })
   }
@@ -224,10 +242,10 @@ export class GameRenderer {
    * @param {Object} spline
    * @param {string} playerRiderId - id du coureur suivi par la caméra
    */
-  updateRiders(riders, spline, playerRiderId) {
+  updateRiders(riders, spline, followedRiderId) {
     if (!spline) return
 
-    let playerPx = null
+    let followedPx = null
 
     for (const rider of riders) {
       const entry = this._sprites.get(rider.id)
@@ -245,12 +263,12 @@ export class GameRenderer {
       this._drawRiderShape(entry.gfx, rider)
 
       // Cône d'aspiration (debug)
-      if (this._showCones) this._drawCone(rider, px)
+      if (this._showCones) this._drawCone(rider, px, { x: entry.gfx.x, y: entry.gfx.y })
 
-      if (rider.id === playerRiderId) playerPx = px
+      if (rider.id === followedRiderId) followedPx = px
     }
 
-    if (playerPx) this._followCamera(playerPx)
+    if (followedPx) this._followCamera(followedPx, followedRiderId)
   }
 
   /**
@@ -312,10 +330,17 @@ export class GameRenderer {
    * @param {Object} rider - doit porter rider.screenCount
    * @param {{x,y,rotation}} px - position pixel et orientation du coureur
    */
-  _drawCone(rider, px) {
+  _drawCone(rider, px, spritePos) {
     const entry = this._cones.get(rider.id)
     if (!entry) return
     const { cone, label } = entry
+
+    // Ancrer le cône sur la position RENDUE du sprite (qui suit son propre lerp
+    // visuel ×0.25), pas sur px brut : sinon, à vitesse de simulation élevée, le
+    // sprite est à la traîne de px et le cône s'en détache. On garde l'orientation
+    // de px (tangente à la route au point courant).
+    const cx = spritePos ? spritePos.x : px.x
+    const cy = spritePos ? spritePos.y : px.y
 
     const dist = CONE_DIST_M * SCALE
     // Le cône d'abri s'étend vers l'arrière : direction opposée au cap.
@@ -325,31 +350,70 @@ export class GameRenderer {
 
     cone.clear()
     cone.beginFill(0x34d399, 0.07)
-    cone.moveTo(px.x, px.y)
+    cone.moveTo(cx, cy)
     const ARC_STEPS = 8
     for (let i = 0; i <= ARC_STEPS; i++) {
       const a = aLeft + (aRight - aLeft) * (i / ARC_STEPS)
-      cone.lineTo(px.x + Math.cos(a) * dist, px.y + Math.sin(a) * dist)
+      cone.lineTo(cx + Math.cos(a) * dist, cy + Math.sin(a) * dist)
     }
-    cone.lineTo(px.x, px.y)
+    cone.lineTo(cx, cy)
     cone.endFill()
 
     // Label : nombre d'écrans captés par CE coureur (debug, exact)
     const sc = rider.screenCount ?? 0
     label.visible = sc > 0
     label.text = sc > 0 ? `${sc}` : ''
-    label.x = px.x
-    label.y = px.y - 14
+    label.x = cx
+    label.y = cy - 14
   }
 
   // ─── Caméra ────────────────────────────────────────────────────────────────
-  _followCamera(riderPx) {
+  // Suivi temporisé indépendant du framerate. Un lerp à pas fixe (× 0.07 par
+  // frame) a une vitesse de poursuite plafonnée : dès que le coureur va plus
+  // vite que ce plafond (simulation ×10/×30), la caméra reste à la traîne et
+  // le coureur dérive vers le bord. On exprime le lissage en fonction du temps
+  // écoulé : facteur = 1 - exp(-k·dt). Sur le même dt, le rattrapage est
+  // constant quelle que soit la cadence de frames.
+  _followCamera(riderPx, followedId) {
     const w = this.app.screen.width
     const h = this.app.screen.height
     const targetX = w / 2 - riderPx.x * this._zoom
     const targetY = h / 2 - riderPx.y * this._zoom
-    this.world.x += (targetX - this.world.x) * 0.07
-    this.world.y += (targetY - this.world.y) * 0.07
+
+    // dt réel depuis la dernière frame (borné pour éviter un saut après un
+    // onglet en arrière-plan / pause).
+    const now = performance.now()
+    let dt = this._lastFrameMs == null ? 16 : now - this._lastFrameMs
+    this._lastFrameMs = now
+    dt = Math.min(dt, 100)
+
+    // Changement de coureur suivi (flèches ←/→, clic) : on recale la caméra
+    // d'un coup plutôt que de la faire glisser à travers tout le peloton.
+    if (followedId !== this._lastFollowedId) {
+      this._lastFollowedId = followedId
+      this.world.x = targetX
+      this.world.y = targetY
+      this._lastCamPx = riderPx
+      return
+    }
+
+    // Lissage temporel : TAU ms pour résorber ~63 % de l'écart. ~120 ms donne
+    // un suivi doux. Mais à simulation accélérée (×10/×30) la cible se déplace
+    // beaucoup entre deux frames : un lissage doux laisse un décalage résiduel
+    // proportionnel à la vitesse (la caméra traîne à ~vitesse×TAU du centre).
+    // On resserre donc le lissage en fonction du saut de cible par frame :
+    // plus le coureur file, plus la caméra colle (jusqu'au quasi-snap).
+    const dTarget = Math.hypot(targetX - this.world.x, targetY - this.world.y)
+    const TAU = 120
+    let a = 1 - Math.exp(-dt / TAU)
+    // Renfort vitesse : au-delà de ~120 px d'écart on pousse le rattrapage
+    // vers 1 (snap), pour rester centré même en ×30. En ×1 l'écart est petit,
+    // ce terme est négligeable et on garde le suivi doux.
+    const speedBoost = Math.min(1, dTarget / 600)
+    a = a + (1 - a) * speedBoost
+    this.world.x += (targetX - this.world.x) * a
+    this.world.y += (targetY - this.world.y) * a
+    this._lastCamPx = riderPx
   }
 
   _gradientColor(gradient) {

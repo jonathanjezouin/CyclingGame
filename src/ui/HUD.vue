@@ -56,22 +56,36 @@
 
     <!-- Panneau actions droite -->
     <div class="hud-panel hud-right">
-      <div class="panel-title">Zone d'effort</div>
+      <div class="panel-title">Intensité (% FTP)</div>
 
-      <div class="zone-buttons">
-        <button
-          v-for="z in zoneChoices"
-          :key="z.id"
-          class="zone-btn"
-          :class="{ active: rider.targetZone === z.id }"
-          :style="rider.targetZone === z.id ? { borderColor: z.color, backgroundColor: z.color + '22' } : {}"
-          @click="$emit('setTargetZone', z.id)"
+      <!-- Slider de puissance continue : bandes de zones colorées en fond,
+           curseur = powerFrac. Flèches ↑/↓ pour ajuster finement. -->
+      <div class="power-control">
+        <div
+          class="power-track"
+          ref="powerTrack"
+          @click="onTrackClick"
         >
-          <span class="zbtn-label" :style="rider.targetZone === z.id ? { color: z.color } : {}">
-            {{ z.label }}
-          </span>
-          <span class="zbtn-name">{{ z.name }}</span>
-        </button>
+          <!-- Bandes de zones (affichage indicatif) -->
+          <div
+            v-for="band in zoneBands"
+            :key="band.id"
+            class="power-band"
+            :style="{ bottom: band.bottom + '%', height: band.height + '%', backgroundColor: band.color }"
+          >
+            <span class="power-band-label">{{ band.label }}</span>
+          </div>
+          <!-- Curseur -->
+          <div class="power-thumb" :style="{ bottom: thumbPct + '%' }">
+            <div class="power-thumb-line"></div>
+          </div>
+        </div>
+        <div class="power-readout">
+          <div class="power-pct">{{ Math.round((rider.powerFrac ?? 0.83) * 100) }}%</div>
+          <div class="power-watts">{{ Math.round((rider.powerFrac ?? 0.83) * rider.energy.ftpWatts) }} W</div>
+          <div class="power-zone" :style="{ color: currentZone.color }">{{ currentZone.label }} · {{ currentZone.name }}</div>
+          <div class="power-hint">↑ / ↓</div>
+        </div>
       </div>
 
       <!-- Pause -->
@@ -116,8 +130,8 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
-import { ZONES, EFFORT_MODES } from '../simulation/engine.js'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
+import { ZONES, getZoneFromFtpRatio } from '../simulation/engine.js'
 
 const props = defineProps({
   rider: { type: Object, required: true },
@@ -126,7 +140,69 @@ const props = defineProps({
   paused: { type: Boolean, default: false },
 })
 
-defineEmits(['setTargetZone', 'dsAction', 'setTimeScale', 'togglePause'])
+const emit = defineEmits(['setPowerFrac', 'dsAction', 'setTimeScale', 'togglePause'])
+
+// Plage du slider de puissance (fraction de FTP). 50% → 150%.
+const POWER_MIN = 0.50
+const POWER_MAX = 1.50
+const POWER_STEP = 0.01   // pas des flèches ↑/↓ (1% de FTP)
+
+const powerTrack = ref(null)
+
+// Position du curseur en % de la hauteur du track (0 = bas/POWER_MIN).
+const thumbPct = computed(() => {
+  const f = props.rider.powerFrac ?? 0.83
+  return ((f - POWER_MIN) / (POWER_MAX - POWER_MIN)) * 100
+})
+
+// Zone courante (dérivée de powerFrac) — affichage indicatif.
+const currentZone = computed(() => {
+  const id = getZoneFromFtpRatio(props.rider.powerFrac ?? 0.83)
+  return Object.values(ZONES).find(z => z.id === id) ?? ZONES.Z3
+})
+
+// Bandes de zones colorées en fond du slider, bornées à la plage du slider.
+const zoneBands = computed(() => {
+  const span = POWER_MAX - POWER_MIN
+  return Object.values(ZONES).map(z => {
+    const lo = Math.max(POWER_MIN, z.ftpMin)
+    const hi = Math.min(POWER_MAX, z.ftpMax)
+    if (hi <= lo) return null
+    return {
+      id: z.id, label: z.label, color: z.color,
+      bottom: ((lo - POWER_MIN) / span) * 100,
+      height: ((hi - lo) / span) * 100,
+    }
+  }).filter(Boolean)
+})
+
+function setPower(frac) {
+  const clamped = Math.max(POWER_MIN, Math.min(POWER_MAX, frac))
+  emit('setPowerFrac', clamped)
+}
+
+// Clic sur le track : positionne la puissance à la hauteur cliquée.
+function onTrackClick(e) {
+  const el = powerTrack.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const frac01 = 1 - (e.clientY - rect.top) / rect.height   // 0 en bas, 1 en haut
+  setPower(POWER_MIN + frac01 * (POWER_MAX - POWER_MIN))
+}
+
+// Flèches ↑/↓ : ajustement fin de la puissance (la molette est prise par le
+// zoom, les flèches ←/→ par la navigation entre coureurs).
+function onKeyDown(e) {
+  if (e.code === 'ArrowUp') {
+    e.preventDefault()
+    setPower((props.rider.powerFrac ?? 0.83) + POWER_STEP)
+  } else if (e.code === 'ArrowDown') {
+    e.preventDefault()
+    setPower((props.rider.powerFrac ?? 0.83) - POWER_STEP)
+  }
+}
+onMounted(() => window.addEventListener('keydown', onKeyDown))
+onUnmounted(() => window.removeEventListener('keydown', onKeyDown))
 
 const endurancePct = computed(() => {
   const e = props.rider.energy.endurance
@@ -148,10 +224,6 @@ const activeZone = computed(() => {
   const z = props.rider.energy.zone ?? 2
   return Object.values(ZONES).find(zn => zn.id === z) ?? ZONES.Z2
 })
-
-const zoneChoices = Object.values(ZONES).map(z => ({
-  id: z.id, label: z.label, name: z.name, color: z.color,
-}))
 
 const timeScales = [1, 5, 10, 30]
 </script>
@@ -320,42 +392,89 @@ const timeScales = [1, 5, 10, 30]
 }
 
 /* Actions d'effort */
-.zone-buttons {
+.power-control {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+  height: 200px;
+}
+
+.power-track {
+  position: relative;
+  width: 34px;
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 1px solid rgba(255,255,255,0.15);
+  background: rgba(0,0,0,0.3);
+}
+
+.power-band {
+  position: absolute;
+  left: 0;
+  right: 0;
+  opacity: 0.35;
+}
+
+.power-band-label {
+  position: absolute;
+  left: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 9px;
+  font-weight: 700;
+  color: rgba(255,255,255,0.85);
+  pointer-events: none;
+}
+
+.power-thumb {
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  height: 0;
+  z-index: 2;
+}
+
+.power-thumb-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: #fff;
+  box-shadow: 0 0 4px rgba(0,0,0,0.6);
+  border-radius: 2px;
+}
+
+.power-readout {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  justify-content: center;
+  gap: 2px;
 }
 
-.zone-btn {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  background: rgba(255,255,255,0.05);
-  border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 6px;
-  padding: 6px 10px;
-  cursor: pointer;
-  transition: all 0.15s;
+.power-pct {
+  font-size: 22px;
+  font-weight: 700;
   color: #fff;
+  line-height: 1;
 }
 
-.zone-btn:hover {
-  background: rgba(255,255,255,0.1);
-}
-
-.zone-btn.active {
-  background: rgba(255,255,255,0.08);
-}
-
-.zbtn-label {
+.power-watts {
   font-size: 12px;
-  font-weight: 600;
-  color: rgba(255,255,255,0.8);
+  color: rgba(255,255,255,0.6);
 }
 
-.zbtn-name {
+.power-zone {
+  font-size: 11px;
+  font-weight: 600;
+  margin-top: 4px;
+}
+
+.power-hint {
   font-size: 10px;
   color: rgba(255,255,255,0.4);
+  margin-top: 6px;
 }
 
 .pause-btn {

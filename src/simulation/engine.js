@@ -22,13 +22,45 @@ const W_FAIL_POWER_FACTOR = 0.50
 // ─── Taux de consommation/récupération d'énergie ────────────────────────────
 // Source de vérité unique, partagée entre applyEnergy() (tick réel) et
 // computeEnduranceDrain()/computeWPrimeDrain() (projection C1).
-// Endurance — zones aérobies (Z1-Z3) : joules gameplay/sec, indexé par zone.
-const ENDURANCE_AEROBIC_RATES = [0, 0.2, 0.5, 1.0]
-// Endurance — zones anaérobies (Z4-Z6) : drain additionnel constant (J/sec).
-const ENDURANCE_ANAEROBIC_RATE = 2
-// W' — récupération passive en zones aérobies (J/sec).
+//
+// Modèle continu (v1.2) : le coût n'est plus indexé sur le LABEL de zone mais
+// sur la puissance réelle vs FTP. W' se vide des watts au-dessus du seuil et se
+// recharge du déficit en dessous ; l'Endurance draine en (P/FTP)².
+//
+// Endurance — taux de base (J gameplay/sec) à 1.0×FTP. Le drain réel vaut
+// ENDURANCE_BASE_RATE × (P/FTP)². Calibré pour qu'une étape longue en
+// croisière (~0.65×FTP) ne vide pas la jauge, mais qu'une HC soutenue pèse.
+// Taux de base (J gameplay/sec) du drain d'endurance à 1.0×FTP. Drain réel =
+// ENDURANCE_BASE_RATE × (P/FTP)². Calibrage PROVISOIRE (à réétudier) : abaissé
+// de 1.6 à 1.0 pour qu'une longue ascension soutenue ne vide pas la jauge —
+// sans ce réglage, 30 km de col faisaient exploser tout le peloton.
+const ENDURANCE_BASE_RATE = 1.0
+
+// Taille de la jauge Endurance selon l'enduranceFactor du coureur. L'endurance
+// n'est PAS identique pour tous : un coureur endurant (rouleur, endF ~0.90) a un
+// réservoir nettement plus grand qu'un profil explosif (sprinteur, endF ~0.74),
+// donc il tient mieux sur la longueur. Sans ça, la jauge plate ne récompenserait
+// que le FTP brut et pénaliserait les petits gabarits (faible FTP → % plus haut
+// pour avancer → vidé plus vite). Référence : 0.84 → 9000 J.
+//   endF 0.74 → ~6900 J   |   0.84 → 9000 J   |   0.90 → ~10300 J
+const ENDURANCE_REF_FACTOR = 0.84
+const ENDURANCE_REF_MAX = 9000
+export function enduranceMaxFor(enduranceFactor = ENDURANCE_REF_FACTOR) {
+  // Sensibilité : ±0.01 d'endF ≈ ±210 J autour de la référence.
+  const max = ENDURANCE_REF_MAX + (enduranceFactor - ENDURANCE_REF_FACTOR) * 21000
+  return Math.round(Math.max(5000, max))
+}
+// W' — puissance de récupération de référence (W sous le FTP) à laquelle la
+// recharge atteint son taux nominal. Au-delà, la recharge plafonne.
+const WPRIME_RECOVERY_REF_W = 100
+// W' — taux de recharge nominal (J/sec) quand le déficit atteint la référence,
+// avant modulation enduranceFactor × freshness.
 const WPRIME_RECOVERY_RATE = 50
-// W' — drain en zones anaérobies (J/sec), indexé par zone.
+
+// ─── LEGACY (projection C1 historique / compat tests) ───────────────────────
+// Conservés pour référence ; le tick réel n'indexe plus le coût sur la zone.
+const ENDURANCE_AEROBIC_RATES = [0, 0.2, 0.5, 1.0]
+const ENDURANCE_ANAEROBIC_RATE = 2
 const WPRIME_ANAEROBIC_RATES = { 4: 80, 5: 200, 6: 500 }
 
 // ─── Aspiration / draft (Bloc A — TDD v0.5 §4bis.3) ─────────────────────────
@@ -178,7 +210,11 @@ export function createRider(overrides = {}) {
     },
     // État courant
     speedKmh: 0,
-    targetZone: 3,            // zone d'effort cible (1-6) — joueur ET IA
+    // Intensité cible en FRACTION CONTINUE de FTP (joueur ET IA). C'est la vraie
+    // commande d'effort ; targetZone en est dérivé pour l'affichage (HUD/fiche).
+    // 0.83 ≈ tempo (ancien Z3 par défaut).
+    powerFrac: 0.83,
+    targetZone: 3,            // zone dérivée de powerFrac — lecture seule (affichage)
     effortMode: 'maintien',  // LEGACY — conservé pour compat HUD/projection
     distanceTravelled: 0,
     screenCount: 0,        // écrans devant dans le cône (Bloc A) — calculé par la boucle
@@ -246,25 +282,35 @@ export function createRidersFromRoster(roster, opts = {}) {
     const lateralOffset = (i % 2 === 0 ? 1 : -1) * 0.4 * (isPlayer ? 1 : 1)
 
     const make = isPlayer ? createRider : createAIRider
-    const profileName = isPlayer ? null : (entry.aiProfile ?? 'rouleur')
-    // Joueur : profil dérivé de son FTP roster (pas de jitter) ; IA : profil
-    // amateur du type, avec variation individuelle reproductible (graine = id).
-    const prof = isPlayer
-      ? { mass: 75, ftpWatts: entry.ftpWatts ?? 280, wPrimeJ: 25000, maxAnaerobicPower: 900, enduranceFactor: 0.86 }
-      : makeRiderProfile(profileName, entry.id ?? `rider_${i}`)
+
+    // Caractéristiques : priorité aux valeurs EN DUR du roster (mass, ftpWatts,
+    // wPrimeJ, maxAnaerobicPower, enduranceFactor). Si une valeur manque, on
+    // retombe sur le profil amateur (aiProfile, optionnel) ou des défauts.
+    const fallback = entry.aiProfile
+      ? makeRiderProfile(entry.aiProfile, entry.id ?? `rider_${i}`)
+      : { mass: 75, ftpWatts: 260, wPrimeJ: 16000, maxAnaerobicPower: 800, enduranceFactor: 0.84 }
+    const prof = {
+      mass:              entry.mass              ?? fallback.mass,
+      ftpWatts:          entry.ftpWatts          ?? fallback.ftpWatts,
+      wPrimeJ:           entry.wPrimeJ           ?? fallback.wPrimeJ,
+      maxAnaerobicPower: entry.maxAnaerobicPower ?? fallback.maxAnaerobicPower,
+      enduranceFactor:   entry.enduranceFactor   ?? fallback.enduranceFactor,
+    }
 
     return make({
       id:   entry.id   ?? `rider_${String(i).padStart(3, '0')}`,
       name: entry.name ?? `Coureur ${i + 1}`,
       isPlayer,
       role: entry.role ?? 'allrounder',
-      aiProfile: profileName,
+      // aiProfile conservé seulement s'il est fourni (plus requis) — pour
+      // l'instant tous les coureurs partagent le même raisonnement couche 1.
+      aiProfile: isPlayer ? null : (entry.aiProfile ?? 'coureur'),
       splinePos,
       renderPos: splinePos,
       lateralOffset,
       profile: prof,
       energy: {
-        endurance:  { current: 9000, max: 9000 },
+        endurance:  { current: enduranceMaxFor(prof.enduranceFactor), max: enduranceMaxFor(prof.enduranceFactor) },
         wPrime:     { current: prof.wPrimeJ, max: prof.wPrimeJ },
         zone:       2,
         ftpWatts:   prof.ftpWatts,
@@ -450,6 +496,50 @@ export function upcomingFlats(route, fromSplinePos) {
   return _upcomingSegments(route, fromSplinePos, FLAT_SEGMENT_TYPES)
 }
 
+// Écart maximal (m) entre deux segments de montée pour qu'ils soient considérés
+// comme UNE SEULE ascension. Couvre les replats/faux-plats d'approche : un
+// faux-plat de 2% suivi d'un mur à 7% est une seule ascension pour le coureur,
+// pas deux bosses. Au-delà de ce seuil (vraie descente, longue section plate),
+// ce sont des ascensions distinctes.
+const ASCENT_MERGE_GAP_M = 2500
+
+/**
+ * Regroupe les segments de montée (climb/hc_climb) contigus — ou séparés par un
+ * court intervalle (≤ ASCENT_MERGE_GAP_M) — en ASCENSIONS logiques uniques.
+ * Une ascension = { from, to, lengthM } couvrant tout l'ensemble.
+ *
+ * C'est la granularité « difficulté » telle que la perçoit un coureur : le
+ * faux-plat d'approche et le mur qui suit forment un seul objectif (le sommet),
+ * pas deux bosses comptées séparément.
+ *
+ * @param {Object} route - expose `segments`
+ * @returns {Array<{from:number,to:number,lengthM:number}>} ascensions triées
+ */
+export function ascents(route) {
+  const climbs = (route?.segments ?? [])
+    .filter(s => CLIMB_SEGMENT_TYPES.includes(s.type))
+    .sort((a, b) => a.from - b.from)
+  const merged = []
+  for (const seg of climbs) {
+    const last = merged[merged.length - 1]
+    if (last && seg.from - last.to <= ASCENT_MERGE_GAP_M) {
+      last.to = seg.to   // prolonge l'ascension en cours
+    } else {
+      merged.push({ from: seg.from, to: seg.to })
+    }
+  }
+  return merged.map(a => ({ ...a, lengthM: a.to - a.from }))
+}
+
+/**
+ * Ascensions (fusionnées) à venir depuis `fromSplinePos` — celle en cours
+ * incluse si le coureur est dedans. Sert au garde-fou prospectif (combien de
+ * difficultés majeures restent) et au budget de montée.
+ */
+export function upcomingAscents(route, fromSplinePos) {
+  return ascents(route).filter(a => a.to > fromSplinePos)
+}
+
 /**
  * Écart (m) entre le coureur `rider` et le groupe situé juste devant le sien.
  * Dérivé de `groups` (sortie de updateGroups, triée de l'avant vers l'arrière).
@@ -547,7 +637,8 @@ const _pct = (ratio) => Math.round(ratio * 100)
 // Anti-girouette — seuils de wBalance (fraction du max) encadrant les montées
 // de zone. On DESCEND de zone dès qu'on passe sous _LOW (sécurité, immédiat),
 // mais on ne REMONTE qu'au-dessus de _HIGH : la bande morte tue l'oscillation.
-const WBAL_DROP_BELOW = 0.15   // sous ce niveau → cap forcé à la baisse
+const WBAL_DROP_BELOW = 0.15   // sous ce niveau → entre en récupération W' (latché)
+const WBAL_RECOVER_EXIT = 0.30 // ne sort de récupération qu'au-dessus (hystérésis)
 const WBAL_RAISE_ABOVE = 0.40  // au-dessus → autorisé à viser plus haut à nouveau
 // Engagement minimum : une zone choisie est tenue ce nombre de ticks (s) avant
 // qu'une nouvelle MONTÉE de zone soit permise (une baisse d'urgence passe outre).
@@ -559,6 +650,15 @@ function _massClimbZoneCap(mass) {
   if (mass >= 82) return 4   // gabarit lourd : pas au-delà du seuil en montée
   if (mass >= 74) return 5
   return 6                   // léger : peut monter en VO2max/sprint sur la bosse
+}
+
+// Distance restante (m) jusqu'au sommet de l'ASCENSION en cours (segments de
+// montée fusionnés — faux-plat d'approche + mur comptent comme un seul objectif),
+// ou null si le coureur n'est pas dans une montée. Sert au budget d'effort :
+// « quelle intensité puis-je tenir jusqu'au sommet sans exploser ? ».
+function _remainingClimbM(route, splinePos) {
+  const asc = ascents(route).find(a => splinePos >= a.from && splinePos < a.to)
+  return asc ? (asc.to - splinePos) : null
 }
 
 /**
@@ -580,14 +680,39 @@ function _massClimbZoneCap(mass) {
  * @param {Object} context - { simSec } horodatage simulé (B1, optionnel)
  * @returns {number} zone cible (1-6)
  */
-export function decideTargetZone(rider, route, context = {}) {
-  // Joueur : pas de décision IA, il pilote sa propre zone.
-  if (!rider.aiProfile) return rider.targetZone
+/**
+ * Décide l'intensité cible d'un coureur seul (couche 1), en FRACTION CONTINUE
+ * de FTP — pas en zones. Mute rider.powerFrac (la commande réelle) et, pour
+ * l'affichage, rider.targetZone / rider.aiState dérivés. Journalise dans aiLog
+ * les changements notables. No-op pour le joueur (il pilote son powerFrac).
+ *
+ * Modèle (IA Couches v0.1, raffiné) :
+ *  - Plat/faux-plat : intensité d'endurance (≈ 0.78×FTP), un peu plus haut en
+ *    approche d'arrivée. Descente : on récupère (le gain de vitesse ne vaut pas
+ *    l'énergie dépensée).
+ *  - Montée : GESTION DE BUDGET CONTINUE. On vise la puissance qui épuise le W'
+ *    (moins une petite marge) pile au sommet de l'ASCENSION ENTIÈRE, en tenant
+ *    compte des ascensions encore à venir (on garde du jus pour la suite).
+ *    Régulation fine à chaque tick : si on est en avance sur la courbe de
+ *    vidage idéale on pousse un peu, en retard on lève le pied. Près du sommet,
+ *    légère relance pour « finir » le W'.
+ *  - Sécurité : réserve très basse → on plafonne sous le seuil pour recharger ;
+ *    explosion Endurance → intensité minimale.
+ *
+ * @param {Object} rider   - coureur IA (rider.aiProfile défini ; sinon no-op)
+ * @param {Object} route   - expose getGradientAt, totalLength, segments
+ * @param {Object} context - { simSec } horodatage simulé (B1, optionnel)
+ * @returns {number} fraction de FTP cible (powerFrac)
+ */
+export function decidePowerTarget(rider, route, context = {}) {
+  // Joueur : pas de décision IA, il pilote son propre powerFrac.
+  if (!rider.aiProfile) return rider.powerFrac
 
   const { simSec } = context
   const energy = rider.energy
   const prof = rider.profile ?? {}
   const mass = prof.mass ?? 75
+  const ftp = energy.ftpWatts
   const wBal = energy.wPrime.current / energy.wPrime.max
   const gradient = route?.getGradientAt ? route.getGradientAt(rider.splinePos) : 0
   const totalLength = route?.totalLength ?? Infinity
@@ -595,92 +720,160 @@ export function decideTargetZone(rider, route, context = {}) {
     ? Math.max(0, totalLength - rider.splinePos)
     : Infinity
 
-  // 1. Zone de base (plat / faux-plat) — bornée par le temps restant.
-  //    En approche de l'arrivée (< 2 km), plus rien à garder → Z3.
-  let zone = distanceToFinish <= 2000 ? 3 : 2
+  // Bornes d'intensité (fraction de FTP) accessibles à ce coureur. Le plafond
+  // en montée dépend de la masse : un gabarit lourd ne tient pas aussi haut
+  // au-dessus du seuil qu'un grimpeur léger (et donc décroche).
+  const climbCeil = _massPowerCeil(mass)   // ex. léger 1.15, lourd 1.00
+
+  let target           // fraction de FTP visée
   let reason
 
-  // 2. Modulation par la pente : tenir la vitesse en montée coûte cher → +1 zone.
-  const climbCap = _massClimbZoneCap(mass)
   if (gradient >= 2) {
-    zone = Math.min(zone + 1, climbCap)
-    // 4. Autorisation de puiser dans W' : si ça redescend/s'aplanit juste après
-    //    (à ~200 m), on tolère une zone de plus pour finir la bosse.
-    const aheadPos = Math.min(totalLength, rider.splinePos + 200)
-    const gradientAhead = route?.getGradientAt ? route.getGradientAt(aheadPos) : gradient
-    if (gradientAhead < gradient - 1 && wBal > WBAL_RAISE_ABOVE) {
-      zone = Math.min(zone + 1, climbCap)
+    // ── MONTÉE : gestion de budget continue ───────────────────────────────
+    // Marge de sécurité : on ne vide pas tout le W' (cycliste prudent).
+    const SAFETY = 0.12
+    // Ascensions encore à venir APRÈS celle-ci : on réserve une part du W' pour
+    // elles (plus il en reste, moins on engage maintenant).
+    const after = upcomingAscents(route, rider.splinePos)
+      .filter(a => !(rider.splinePos >= a.from && rider.splinePos < a.to)).length
+    const reserveForLater = Math.min(0.5, after * 0.25)
+
+    const wAvail = energy.wPrime.current
+    const wBudget = Math.max(0, wAvail - (SAFETY + reserveForLater) * energy.wPrime.max)
+
+    // Temps estimé jusqu'au sommet de l'ascension entière, à la vitesse courante.
+    const remainM = _remainingClimbM(route, rider.splinePos) ?? 600
+    const vMs = Math.max(2, (rider.speedKmh ?? 0) / 3.6)
+    const timeToTopSec = Math.max(1, remainM / vMs)
+
+    // Puissance excédentaire (au-dessus du FTP) finançable par le budget sur ce
+    // temps : excessW = wBudget / timeToTop. La cible = FTP + cet excédent.
+    const excessW = wBudget / timeToTopSec
+    let frac = 1 + excessW / ftp                 // continu, pas de palier
+    frac = Math.min(frac, climbCeil)             // plafond masse
+    frac = Math.max(frac, 0.90)                  // en montée on est au moins proche du seuil
+
+    // Relance de fin : si le sommet est proche (< 1.2 km) et qu'il reste du W',
+    // on « finit » la cartouche — petit coup de collier.
+    if (remainM < 1200 && wBal > 0.15 && after === 0) {
+      frac = Math.min(climbCeil + 0.05, frac + 0.10)
     }
-    reason = `Montée ${gradient.toFixed(1)}% → vise Z${zone} (plafond masse Z${climbCap}, ${mass}kg).`
+
+    target = frac
+    const wkg = (ftp / mass).toFixed(1)
+    reason = `Montée ${gradient.toFixed(1)}% sur ${(remainM/1000).toFixed(1)}km → ` +
+             `${Math.round(frac*100)}% FTP (W' réparti jusqu'au sommet, ${wkg} W/kg` +
+             `${after ? `, ${after} ascension(s) après` : ''}${remainM<1200&&after===0?', relance finale':''}).`
   } else if (gradient <= -3) {
-    // Descente : inutile de forcer, on récupère.
-    zone = Math.min(zone, 2)
-    reason = `Descente ${gradient.toFixed(1)}% → récup en Z${zone}.`
+    // ── DESCENTE : on ne force pas trop (le gain de vitesse coûte cher en watts
+    //    à cause de l'aéro), mais on PÉDALE quand même pour ne pas tout rendre —
+    //    un grimpeur qui a pris du temps en montée défend sa position. C'est en
+    //    descente que les gabarits lourds reprennent naturellement (gravité), on
+    //    limite la casse sans gaspiller.
+    target = 0.72
+    reason = `Descente ${gradient.toFixed(1)}% → on garde du rythme (${Math.round(target*100)}% FTP).`
   } else {
-    reason = `Plat/faux-plat → Z${zone} (arrivée à ${(distanceToFinish/1000).toFixed(1)} km).`
-  }
-
-  // 3. Garde-fou prospectif : répartir W' sur les bosses restantes.
-  //    Beaucoup de montées encore à venir → on cape pour ne pas tout donner.
-  const climbsAhead = (typeof upcomingClimbs === 'function' && route?.segments)
-    ? upcomingClimbs(route, rider.splinePos).length : 0
-  if (climbsAhead >= 2 && zone >= 5) {
-    zone = 4
-    reason += ` ${climbsAhead} bosses restantes → cap Z4 (je ne donne pas tout sur la première).`
-  }
-
-  // 5. Bornage dynamique par wBalance (réserve disponible) — sécurité immédiate.
-  if (wBal < WBAL_DROP_BELOW) {
-    zone = Math.min(zone, energy.exploded ? 1 : 2)
-    reason = `Réserve W' basse (${_pct(wBal)}%) → cap Z${zone}, la réserve se recharge.`
-  } else if (energy.exploded) {
-    zone = 1
-    reason = `Explosion Endurance → Z1 forcé (irréversible).`
-  }
-
-  // ── Filtre anti-girouette ──────────────────────────────────────────────
-  const prev = rider.targetZone ?? zone
-  const lastChange = rider._zoneCommitSec ?? -Infinity
-  const committedFor = (simSec ?? 0) - lastChange
-  if (zone > prev) {
-    // Monter de zone : exige hystérésis (réserve au-dessus du seuil haut) ET
-    // engagement minimum tenu. Sinon on reste sur la zone précédente.
-    const allowed = wBal >= WBAL_RAISE_ABOVE && committedFor >= ZONE_COMMIT_TICKS
-    if (!allowed) {
-      zone = prev
-      reason = `Maintien Z${zone} (anti-girouette : hystérésis/engagement non franchis).`
+    // ── PLAT / FAUX-PLAT : intensité d'endurance ───────────────────────────
+    // Plus rien de difficile derrière + arrivée pas si loin → on relâche ce qui
+    // reste (endurance) ; sinon croisière prudente.
+    const ascentsLeft = upcomingAscents(route, rider.splinePos).length
+    if (ascentsLeft === 0 && distanceToFinish < 8000) {
+      // Fin de course sans difficulté : on lâche les watts qu'on a encore.
+      const endFrac = energy.endurance.current / energy.endurance.max
+      target = 0.80 + 0.25 * Math.max(0, endFrac)    // jusqu'à ~1.05 si réservoir plein
+      target = Math.min(target, 1.05)
+      reason = `Plat final, plus de difficulté → on lâche les watts ` +
+               `(${Math.round(target*100)}% FTP, endurance ${Math.round(endFrac*100)}%).`
+    } else {
+      target = distanceToFinish <= 2000 ? 0.88 : 0.78
+      reason = `Plat/faux-plat → croisière ${Math.round(target*100)}% FTP ` +
+               `(arrivée à ${(distanceToFinish/1000).toFixed(1)} km).`
     }
   }
-  // Une baisse de zone est toujours permise (sécurité W').
 
-  if (zone !== prev) rider._zoneCommitSec = simSec ?? 0
+  // ── Sécurité W' / explosion (prioritaire) ───────────────────────────────
+  // Hystérésis sur la récupération W' : on ENTRE en récup sous WBAL_DROP_BELOW
+  // (15%) et on n'en SORT qu'au-dessus de WBAL_RECOVER_EXIT (30%). Sans cette
+  // bande morte, lever le pied remontait aussitôt le W' au-dessus de 15%, donc
+  // on repartait à fond au tick suivant, qui le revidait… → oscillation
+  // 113%→80%→113% par seconde. Le flag latché transforme ça en un vrai cycle
+  // « je me mets en dedans / je récupère / je repars » de plusieurs secondes.
+  if (energy.exploded) {
+    target = 0.50
+    rider._recoveringW = false
+    reason = `Explosion Endurance → ${Math.round(target*100)}% FTP forcé (irréversible).`
+  } else {
+    if (wBal < WBAL_DROP_BELOW) rider._recoveringW = true
+    else if (wBal >= WBAL_RECOVER_EXIT) rider._recoveringW = false
+    if (rider._recoveringW) {
+      target = Math.min(target, 0.80)
+      reason = `Réserve W' basse (${_pct(wBal)}%) → ${Math.round(target*100)}% FTP, je récupère jusqu'à ${Math.round(WBAL_RECOVER_EXIT*100)}%.`
+    }
+  }
 
-  rider.targetZone = zone
-  // aiState : libellé lisible dérivé de la zone (pour la fiche coureur B1).
-  rider.aiState = zone >= 5 ? 'effort_fort' : zone >= 3 ? 'soutenu' : 'economie'
-  _logZoneDecision(rider, simSec, zone, reason)
-  return zone
+  // ── Lissage temporel (anti-girouette continu) ───────────────────────────
+  // On lisse la fraction vers la cible. La hausse est amortie (montée
+  // progressive de l'effort). La baisse est plus rapide mais PAS instantanée :
+  // un lissage descendant évite les à-coups (le claquement 113%→80% vu au log)
+  // tout en restant réactif pour la sécurité.
+  const prev = rider.powerFrac ?? target
+  let next
+  if (target >= prev) {
+    next = prev + (target - prev) * POWER_SMOOTH_UP    // montée douce
+  } else {
+    next = prev + (target - prev) * POWER_SMOOTH_DOWN  // baisse rapide mais lissée
+  }
+
+  rider.powerFrac = next
+  rider.targetZone = getZoneFromFtpRatio(next)     // dérivé pour l'affichage
+  rider.aiState = next >= 1.05 ? 'effort_fort' : next >= 0.80 ? 'soutenu' : 'economie'
+  _logPowerDecision(rider, simSec, reason)
+  return next
 }
 
-// Journal B1 : une entrée par CHANGEMENT de zone cible (pas par tick).
-function _logZoneDecision(rider, simSec, zone, reason) {
+// Plafond d'intensité (fraction de FTP) tenable en montée selon la masse.
+// Continu plutôt que des crans : interpolation linéaire entre un léger (66 kg
+// → 1.18) et un lourd (88 kg → 0.98). Un poids lourd plafonne près du seuil et
+// décroche ; un grimpeur léger peut tenir bien au-dessus.
+function _massPowerCeil(mass) {
+  const t = Math.max(0, Math.min(1, (mass - 66) / (88 - 66)))
+  return 1.18 + (0.98 - 1.18) * t
+}
+
+// Coefficients de lissage de l'intensité par tick. La HAUSSE est douce (montée
+// progressive de l'effort) ; la BAISSE est plus rapide mais pas instantanée
+// (réactive pour la sécurité, sans claquement). ~0.15 ≈ 5 s pour l'essentiel
+// d'un saut à la hausse ; ~0.35 ≈ 2 s à la baisse.
+const POWER_SMOOTH_UP = 0.15
+const POWER_SMOOTH_DOWN = 0.35
+
+// Journal B1 : une entrée quand la RAISON change (changement de phase de
+// course), pas à chaque micro-ajustement de fraction.
+function _logPowerDecision(rider, simSec, reason) {
   if (!rider.aiLog) rider.aiLog = []
   const last = rider.aiLog[rider.aiLog.length - 1]
-  if (!last || last.zone !== zone) {
-    rider.aiLog.push({ simSec: simSec ?? null, zone, aiState: rider.aiState, reason })
+  if (!last || last.reason !== reason) {
+    rider.aiLog.push({ simSec: simSec ?? null, zone: rider.targetZone, aiState: rider.aiState, reason })
     if (rider.aiLog.length > AI_LOG_MAX_ENTRIES) rider.aiLog.shift()
   }
 }
 
 /**
- * Compat : ancien point d'entrée de l'IA. Délègue à decideTargetZone() et
- * renvoie la zone cible (le moteur traduit zone → puissance dans simulateTick).
- * @returns {number} zone cible
+ * Compat : ancien nom. Délègue à decidePowerTarget et renvoie la zone dérivée
+ * (pour le code/tests qui attendaient encore une zone).
  */
-export function aiDecide(rider, context = {}) {
-  return decideTargetZone(rider, context.route, context)
+export function decideTargetZone(rider, route, context = {}) {
+  decidePowerTarget(rider, route, context)
+  return rider.targetZone
 }
 
+/**
+ * Compat : ancien point d'entrée. Délègue à decidePowerTarget.
+ */
+export function aiDecide(rider, context = {}) {
+  decidePowerTarget(rider, context.route, context)
+  return rider.targetZone
+}
 
 // ─── Consommation d'énergie ──────────────────────────────────────────────────
 /**
@@ -693,37 +886,44 @@ export function applyEnergy(rider, powerWatts, dtSec = 1) {
     return
   }
 
-  const ftpRatio = powerWatts / energy.ftpWatts
+  const ftp = energy.ftpWatts
+  const ftpRatio = powerWatts / ftp
+  // La zone reste un libellé de lecture (HUD, fiche) dérivé du ratio — mais le
+  // COÛT ci-dessous n'en dépend plus : il est indexé sur la puissance réelle.
   const zone = getZoneFromFtpRatio(ftpRatio)
   energy.zone = zone
 
-  if (zone <= 3) {
-    // Zones aérobies : consomme Endurance lentement
-    const rate = ENDURANCE_AEROBIC_RATES[zone] ?? ENDURANCE_AEROBIC_RATES[1]
-    energy.endurance.current = Math.max(0, energy.endurance.current - rate * dtSec)
-    // Récupération W' passive — modulée par enduranceFactor × freshness
-    // (IA Couches v0.1 §8 : un coureur « cuit » recharge sa cartouche au ralenti).
-    if (energy.wPrime.current < energy.wPrime.max) {
-      const endF = rider.profile?.enduranceFactor ?? 1
-      const fresh = energy.freshness ?? 1
-      const recovery = WPRIME_RECOVERY_RATE * endF * fresh
-      energy.wPrime.current = Math.min(
-        energy.wPrime.max,
-        energy.wPrime.current + recovery * dtSec
-      )
-    }
-  } else {
-    // Zones anaérobies : consomme W'
-    const wRate = WPRIME_ANAEROBIC_RATES[zone] ?? WPRIME_ANAEROBIC_RATES[6]
-    energy.wPrime.current = Math.max(0, energy.wPrime.current - wRate * dtSec)
-    // Consomme aussi Endurance plus vite
-    energy.endurance.current = Math.max(0, energy.endurance.current - ENDURANCE_ANAEROBIC_RATE * dtSec)
-    // Défaillance W' : si W' atteint 0, crampe locale pendant N ticks
-    // (puissance bridée, cf. simulateTick). Récupération partielle ensuite.
+  // ── W' : modèle continu (inspiré de Skiba) ──────────────────────────────
+  // Au-dessus du FTP, W' se vide proportionnellement aux watts EXCÉDENTAIRES
+  // (powerWatts − ftp). Sous le FTP, il se recharge proportionnellement au
+  // déficit (ftp − powerWatts), modulé par enduranceFactor × freshness.
+  // Conséquence directe : un coureur qui pousse 320 W pour 250 W de FTP dans
+  // une bosse paye, même si le label affiche « Z3 » — le coût suit l'effort,
+  // plus l'étiquette.
+  if (powerWatts > ftp) {
+    const excess = powerWatts - ftp                 // W au-dessus du seuil
+    energy.wPrime.current = Math.max(0, energy.wPrime.current - excess * dtSec)
     if (energy.wPrime.current <= 0 && energy.wFailTicks <= 0) {
       energy.wFailTicks = W_FAIL_DURATION_TICKS
     }
+  } else if (energy.wPrime.current < energy.wPrime.max) {
+    // Recharge : le déficit sous le FTP, plafonné par DCP (puissance de
+    // récupération de référence) pour éviter une recharge instantanée à l'arrêt.
+    const deficit = Math.min(ftp - powerWatts, WPRIME_RECOVERY_REF_W)
+    const endF = rider.profile?.enduranceFactor ?? 1
+    const fresh = energy.freshness ?? 1
+    const recovery = (deficit / WPRIME_RECOVERY_REF_W) * WPRIME_RECOVERY_RATE * endF * fresh
+    energy.wPrime.current = Math.min(energy.wPrime.max, energy.wPrime.current + recovery * dtSec)
   }
+
+  // ── Endurance : coût indexé sur l'intensité réelle (fraction de FTP) ─────
+  // Drain = taux de base × (puissance / FTP)². Le carré accentue le coût des
+  // hautes intensités soutenues : 10 km de HC à 1.0×FTP coûtent bien plus que
+  // du plat à 0.65×FTP, sans paliers de zone. Un effort sous ~0.5×FTP draine
+  // un minimum (le coureur consomme toujours un peu).
+  const intensity = Math.max(0.5, ftpRatio)
+  const enduranceDrain = ENDURANCE_BASE_RATE * intensity * intensity
+  energy.endurance.current = Math.max(0, energy.endurance.current - enduranceDrain * dtSec)
 
   // Explosion Endurance
   if (energy.endurance.current <= 0) {
@@ -783,7 +983,13 @@ export function actionToZone(action, currentGradient) {
  * @param {number} durationSec
  * @returns {number} coût en joules gameplay (toujours ≥ 0)
  */
-export function computeEnduranceDrain(effectivePower, zone, durationSec) {
+export function computeEnduranceDrain(effectivePower, zone, durationSec, ftp) {
+  // Modèle continu : drain = base × (P/FTP)². Si ftp est fourni (4e arg), on
+  // l'utilise ; sinon fallback legacy indexé sur la zone (anciens appels/tests).
+  if (ftp) {
+    const intensity = Math.max(0.5, effectivePower / ftp)
+    return ENDURANCE_BASE_RATE * intensity * intensity * durationSec
+  }
   const rate = zone <= 3
     ? (ENDURANCE_AEROBIC_RATES[zone] ?? ENDURANCE_AEROBIC_RATES[1])
     : ENDURANCE_ANAEROBIC_RATE
@@ -801,7 +1007,15 @@ export function computeEnduranceDrain(effectivePower, zone, durationSec) {
  * @param {number} durationSec
  * @returns {number} coût en joules (négatif = récupération de W')
  */
-export function computeWPrimeDrain(effectivePower, zone, durationSec) {
+export function computeWPrimeDrain(effectivePower, zone, durationSec, ftp) {
+  // Modèle continu : > FTP vide les watts excédentaires ; < FTP recharge du
+  // déficit (plafonné à la référence). Coût net (négatif = recharge). Fallback
+  // legacy par zone si ftp absent.
+  if (ftp) {
+    if (effectivePower > ftp) return (effectivePower - ftp) * durationSec
+    const deficit = Math.min(ftp - effectivePower, WPRIME_RECOVERY_REF_W)
+    return -(deficit / WPRIME_RECOVERY_REF_W) * WPRIME_RECOVERY_RATE * durationSec
+  }
   if (zone <= 3) return -WPRIME_RECOVERY_RATE * durationSec
   const rate = WPRIME_ANAEROBIC_RATES[zone] ?? WPRIME_ANAEROBIC_RATES[6]
   return rate * durationSec
@@ -842,8 +1056,8 @@ export function projectCost(action, rider, route, distanceToNextKeyPoint) {
   const speedMs  = speedKmh / 3.6
   const durationSec = speedMs > 0 ? distanceToNextKeyPoint / speedMs : 0
 
-  const enduranceCost = computeEnduranceDrain(effectivePower, zone, durationSec)
-  const wPrimeCost    = computeWPrimeDrain(effectivePower, zone, durationSec)
+  const enduranceCost = computeEnduranceDrain(effectivePower, zone, durationSec, energy.ftpWatts)
+  const wPrimeCost    = computeWPrimeDrain(effectivePower, zone, durationSec, energy.ftpWatts)
 
   return {
     zone,
@@ -863,11 +1077,10 @@ export function projectCost(action, rider, route, distanceToNextKeyPoint) {
 export function simulateTick(rider, route, dtSec = 1) {
   const { energy } = rider
 
-  // Puissance cible selon la ZONE cible (joueur ou IA — même chemin).
-  // zone → facteur FTP central (ZONE_FTP_TARGET) → watts.
-  const zone = rider.targetZone ?? 3
-  const ftpFactor = ZONE_FTP_TARGET[zone] ?? ZONE_FTP_TARGET[3]
-  let powerWatts = ftpFactor * energy.ftpWatts * energy.dayFormMod
+  // Intensité cible en FRACTION CONTINUE de FTP (joueur ou IA — même chemin).
+  // powerFrac est la commande réelle ; targetZone n'en est qu'un affichage.
+  const frac = rider.powerFrac ?? (ZONE_FTP_TARGET[rider.targetZone ?? 3] ?? 0.83)
+  let powerWatts = frac * energy.ftpWatts * energy.dayFormMod
   if (energy.exploded) powerWatts = energy.ftpWatts * 0.55
 
   // Défaillance W' (crampe) : puissance bridée pendant N ticks, puis récupération

@@ -1,26 +1,206 @@
 {
   "id": "roster_poc_p1",
-  "name": "Peloton POC — Phase 1 (profils amateurs)",
+  "name": "Peloton POC — caractéristiques en dur",
   "riders": [
-    { "id": "rider_001", "name": "Marco Deluca",    "isPlayer": true,  "ftpWatts": 260, "role": "climber",    "aiProfile": null },
-    { "id": "rider_002", "name": "Lucas Ferrer",     "isPlayer": false, "role": "rouleur",   "aiProfile": "rouleur" },
-    { "id": "rider_003", "name": "Tom Bauer",        "isPlayer": false, "role": "rouleur",   "aiProfile": "rouleur" },
-    { "id": "rider_004", "name": "Diego Marín",      "isPlayer": false, "role": "climber",   "aiProfile": "grimpeur" },
-    { "id": "rider_005", "name": "Nils Andersen",    "isPlayer": false, "role": "sprinter",  "aiProfile": "sprinteur" },
-    { "id": "rider_006", "name": "Yannick Lefort",   "isPlayer": false, "role": "puncheur",  "aiProfile": "puncheur" },
-    { "id": "rider_007", "name": "Paolo Greco",      "isPlayer": false, "role": "climber",   "aiProfile": "grimpeur" },
-    { "id": "rider_008", "name": "Sven Holm",        "isPlayer": false, "role": "rouleur",   "aiProfile": "rouleur" },
-    { "id": "rider_009", "name": "Hugo Mertens",     "isPlayer": false, "role": "sprinter",  "aiProfile": "sprinteur" },
-    { "id": "rider_010", "name": "Rafael Costa",     "isPlayer": false, "role": "climber",   "aiProfile": "grimpeur" },
-    { "id": "rider_011", "name": "Erik Vasquez",     "isPlayer": false, "role": "puncheur",  "aiProfile": "puncheur" },
-    { "id": "rider_012", "name": "Mathis Roy",       "isPlayer": false, "role": "rouleur",   "aiProfile": "rouleur" },
-    { "id": "rider_013", "name": "Karl Brenner",     "isPlayer": false, "role": "sprinter",  "aiProfile": "sprinteur" },
-    { "id": "rider_014", "name": "Leon Fischer",     "isPlayer": false, "role": "climber",   "aiProfile": "grimpeur" },
-    { "id": "rider_015", "name": "Adrien Noël",      "isPlayer": false, "role": "rouleur",   "aiProfile": "rouleur" },
-    { "id": "rider_016", "name": "Bruno Sala",       "isPlayer": false, "role": "puncheur",  "aiProfile": "puncheur" },
-    { "id": "rider_017", "name": "Théo Garnier",     "isPlayer": false, "role": "climber",   "aiProfile": "grimpeur" },
-    { "id": "rider_018", "name": "Iván Soto",        "isPlayer": false, "role": "sprinter",  "aiProfile": "sprinteur" },
-    { "id": "rider_019", "name": "Felix Wagner",     "isPlayer": false, "role": "rouleur",   "aiProfile": "rouleur" },
-    { "id": "rider_020", "name": "Owen Walsh",       "isPlayer": false, "role": "puncheur",  "aiProfile": "puncheur" }
+    {
+      "id": "rider_001",
+      "name": "Marco Deluca",
+      "isPlayer": true,
+      "mass": 77.3,
+      "ftpWatts": 233,
+      "wPrimeJ": 14300,
+      "maxAnaerobicPower": 712,
+      "enduranceFactor": 0.86
+    },
+    {
+      "id": "rider_002",
+      "name": "Lucas Ferrer",
+      "isPlayer": false,
+      "mass": 78.2,
+      "ftpWatts": 272,
+      "wPrimeJ": 12043,
+      "maxAnaerobicPower": 811,
+      "enduranceFactor": 0.74
+    },
+    {
+      "id": "rider_003",
+      "name": "Tom Bauer",
+      "isPlayer": false,
+      "mass": 67.2,
+      "ftpWatts": 243,
+      "wPrimeJ": 11318,
+      "maxAnaerobicPower": 699,
+      "enduranceFactor": 0.84
+    },
+    {
+      "id": "rider_004",
+      "name": "Diego Marín",
+      "isPlayer": false,
+      "mass": 75.1,
+      "ftpWatts": 239,
+      "wPrimeJ": 18071,
+      "maxAnaerobicPower": 1005,
+      "enduranceFactor": 0.74
+    },
+    {
+      "id": "rider_005",
+      "name": "Nils Andersen",
+      "isPlayer": false,
+      "mass": 81.3,
+      "ftpWatts": 267,
+      "wPrimeJ": 15083,
+      "maxAnaerobicPower": 678,
+      "enduranceFactor": 0.89
+    },
+    {
+      "id": "rider_006",
+      "name": "Yannick Lefort",
+      "isPlayer": false,
+      "mass": 70.1,
+      "ftpWatts": 228,
+      "wPrimeJ": 12161,
+      "maxAnaerobicPower": 1024,
+      "enduranceFactor": 0.84
+    },
+    {
+      "id": "rider_007",
+      "name": "Paolo Greco",
+      "isPlayer": false,
+      "mass": 81.4,
+      "ftpWatts": 268,
+      "wPrimeJ": 17435,
+      "maxAnaerobicPower": 1087,
+      "enduranceFactor": 0.8
+    },
+    {
+      "id": "rider_008",
+      "name": "Sven Holm",
+      "isPlayer": false,
+      "mass": 75.2,
+      "ftpWatts": 266,
+      "wPrimeJ": 18422,
+      "maxAnaerobicPower": 1031,
+      "enduranceFactor": 0.83
+    },
+    {
+      "id": "rider_009",
+      "name": "Hugo Mertens",
+      "isPlayer": false,
+      "mass": 78.9,
+      "ftpWatts": 235,
+      "wPrimeJ": 13735,
+      "maxAnaerobicPower": 745,
+      "enduranceFactor": 0.75
+    },
+    {
+      "id": "rider_010",
+      "name": "Rafael Costa",
+      "isPlayer": false,
+      "mass": 67.6,
+      "ftpWatts": 225,
+      "wPrimeJ": 14336,
+      "maxAnaerobicPower": 918,
+      "enduranceFactor": 0.8
+    },
+    {
+      "id": "rider_011",
+      "name": "Erik Vasquez",
+      "isPlayer": false,
+      "mass": 70.9,
+      "ftpWatts": 234,
+      "wPrimeJ": 14204,
+      "maxAnaerobicPower": 1068,
+      "enduranceFactor": 0.84
+    },
+    {
+      "id": "rider_012",
+      "name": "Mathis Roy",
+      "isPlayer": false,
+      "mass": 76.6,
+      "ftpWatts": 238,
+      "wPrimeJ": 19750,
+      "maxAnaerobicPower": 682,
+      "enduranceFactor": 0.8
+    },
+    {
+      "id": "rider_013",
+      "name": "Karl Brenner",
+      "isPlayer": false,
+      "mass": 85.7,
+      "ftpWatts": 269,
+      "wPrimeJ": 17683,
+      "maxAnaerobicPower": 942,
+      "enduranceFactor": 0.87
+    },
+    {
+      "id": "rider_014",
+      "name": "Leon Fischer",
+      "isPlayer": false,
+      "mass": 80.6,
+      "ftpWatts": 245,
+      "wPrimeJ": 11385,
+      "maxAnaerobicPower": 758,
+      "enduranceFactor": 0.78
+    },
+    {
+      "id": "rider_015",
+      "name": "Adrien Noël",
+      "isPlayer": false,
+      "mass": 67.1,
+      "ftpWatts": 262,
+      "wPrimeJ": 21516,
+      "maxAnaerobicPower": 757,
+      "enduranceFactor": 0.84
+    },
+    {
+      "id": "rider_016",
+      "name": "Bruno Sala",
+      "isPlayer": false,
+      "mass": 71.5,
+      "ftpWatts": 265,
+      "wPrimeJ": 16506,
+      "maxAnaerobicPower": 732,
+      "enduranceFactor": 0.78
+    },
+    {
+      "id": "rider_017",
+      "name": "Théo Garnier",
+      "isPlayer": false,
+      "mass": 75.5,
+      "ftpWatts": 241,
+      "wPrimeJ": 18015,
+      "maxAnaerobicPower": 1049,
+      "enduranceFactor": 0.8
+    },
+    {
+      "id": "rider_018",
+      "name": "Iván Soto",
+      "isPlayer": false,
+      "mass": 67.3,
+      "ftpWatts": 265,
+      "wPrimeJ": 17114,
+      "maxAnaerobicPower": 645,
+      "enduranceFactor": 0.75
+    },
+    {
+      "id": "rider_019",
+      "name": "Felix Wagner",
+      "isPlayer": false,
+      "mass": 64.6,
+      "ftpWatts": 245,
+      "wPrimeJ": 20505,
+      "maxAnaerobicPower": 811,
+      "enduranceFactor": 0.75
+    },
+    {
+      "id": "rider_020",
+      "name": "Owen Walsh",
+      "isPlayer": false,
+      "mass": 71.2,
+      "ftpWatts": 269,
+      "wPrimeJ": 17349,
+      "maxAnaerobicPower": 1086,
+      "enduranceFactor": 0.88
+    }
   ]
 }

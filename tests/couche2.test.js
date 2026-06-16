@@ -243,12 +243,12 @@ describe('Couche 2 — calage derrière la roue (pas de faux relais)', () => {
     me.aiLog = []
     let ahead = mkRider({ splinePos: 1030 }); ahead.id = 'ahead'   // 30 m → chasse
     decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    const phasesChase = me.aiLog.map(e => e.phase).join(' ')
+    const keysChase = me.aiLog.map(e => e.logKey).join(' ')
     me.screenCount = 3
     ahead = mkRider({ splinePos: 1004 }); ahead.id = 'ahead'       // 4 m → calage
     decidePowerTarget(me, route, { simSec: 12, riders: [me, ahead] })
-    const lastPhase = me.aiLog[me.aiLog.length - 1].phase
-    expect(phasesChase).toMatch(/c2:(chasse|jonction)/)
+    const lastPhase = me.aiLog[me.aiLog.length - 1].logKey
+    expect(keysChase).toMatch(/c2:(chasse|jonction)/)
     expect(lastPhase).toMatch(/c2:(cale|epargne)/)
   })
 })

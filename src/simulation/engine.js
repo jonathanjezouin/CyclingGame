@@ -797,7 +797,8 @@ export function decidePowerTarget(rider, route, context = {}) {
 
   let target           // fraction de FTP visée
   let reason           // texte d'affichage (peut contenir des valeurs mouvantes)
-  let phase            // signature stable de la décision (dédup du journal)
+  let logKey           // clé de déduplication du journal (PAS une machine d'états :
+                       // les décisions viennent de C1/C2, ceci ne fait qu'étiqueter)
 
   if (gradient >= 2) {
     // ── MONTÉE : gestion de budget continue ───────────────────────────────
@@ -833,7 +834,7 @@ export function decidePowerTarget(rider, route, context = {}) {
     target = frac
     const wkg = (ftp / mass).toFixed(1)
     const finishing = remainM < 1200 && after === 0
-    phase = `montee:z${getZoneFromFtpRatio(frac)}${finishing ? ':relance' : ''}`
+    logKey = `montee:z${getZoneFromFtpRatio(frac)}${finishing ? ':relance' : ''}`
     reason = `Montée ${gradient.toFixed(1)}% sur ${(remainM/1000).toFixed(1)}km → ` +
              `${Math.round(frac*100)}% FTP (W' réparti jusqu'au sommet, ${wkg} W/kg` +
              `${after ? `, ${after} ascension(s) après` : ''}${finishing ? ', relance finale' : ''}).`
@@ -844,7 +845,7 @@ export function decidePowerTarget(rider, route, context = {}) {
     //    descente que les gabarits lourds reprennent naturellement (gravité), on
     //    limite la casse sans gaspiller.
     target = 0.72
-    phase = 'descente'
+    logKey = 'descente'
     reason = `Descente ${gradient.toFixed(1)}% → on garde du rythme (${Math.round(target*100)}% FTP).`
   } else {
     // ── PLAT / FAUX-PLAT : intensité d'endurance ───────────────────────────
@@ -856,12 +857,12 @@ export function decidePowerTarget(rider, route, context = {}) {
       const endFrac = energy.endurance.current / energy.endurance.max
       target = 0.80 + 0.25 * Math.max(0, endFrac)    // jusqu'à ~1.05 si réservoir plein
       target = Math.min(target, 1.05)
-      phase = `platfinal:z${getZoneFromFtpRatio(target)}`
+      logKey = `platfinal:z${getZoneFromFtpRatio(target)}`
       reason = `Plat final, plus de difficulté → on lâche les watts ` +
                `(${Math.round(target*100)}% FTP, endurance ${Math.round(endFrac*100)}%).`
     } else {
       target = distanceToFinish <= 2000 ? 0.88 : 0.78
-      phase = `plat:z${getZoneFromFtpRatio(target)}`
+      logKey = `plat:z${getZoneFromFtpRatio(target)}`
       reason = `Plat/faux-plat → croisière ${Math.round(target*100)}% FTP ` +
                `(arrivée à ${(distanceToFinish/1000).toFixed(1)} km).`
     }
@@ -908,11 +909,11 @@ export function decidePowerTarget(rider, route, context = {}) {
         if (over > 0.005) {
           target = fracSolo + over
           const tag = joinOver >= valueOver ? 'jonction' : 'chasse'
-          phase = `c2:${tag}`
+          logKey = `c2:${tag}`
           reason = `Roue devant à ${Math.round(ahead.gap)} m${dGap<0?' (je reviens)':dGap>0?' (elle file)':''} → ` +
                    `+${Math.round(over*100)}% pour recoller${tag==='chasse'?` (abri val ${shelterVal.toFixed(2)})`:''}.`
         } else if (budgetGate <= 0.01) {
-          phase = 'c2:lache'
+          logKey = 'c2:lache'
           reason = `Roue devant à ${Math.round(ahead.gap)} m mais budget épuisé → je laisse filer.`
         }
       } else {
@@ -925,7 +926,7 @@ export function decidePowerTarget(rider, route, context = {}) {
         const wheelTooSlow = finishingSoon && fracSolo > 1.0
 
         if (wheelTooSlow) {
-          phase = 'c2:depasse'
+          logKey = 'c2:depasse'
           reason = `Dans la roue mais ça n'avance pas assez (final) → je passe devant (${Math.round(fracSolo*100)}% FTP).`
         } else {
           // Calage : l'économie vient de l'abri RÉELLEMENT reçu (screenCount) —
@@ -937,7 +938,7 @@ export function decidePowerTarget(rider, route, context = {}) {
           const drift = ahead.gap > C2_SETTLE_HOLD_M + 3 ? 0.03 : 0
           target = Math.max(fracSolo - save + drift, fracSolo - C2_MAX_SAVING)
           const epargne = target < fracSolo - 0.015
-          phase = epargne ? 'c2:epargne' : 'c2:cale'
+          logKey = epargne ? 'c2:epargne' : 'c2:cale'
           const verb = epargne ? "je me cale et j'économise" : 'je me cale derrière'
           reason = `Dans la roue (${Math.round(ahead.gap)} m, abri val ${shelterVal.toFixed(2)}) → ` +
                    `${verb} à ${Math.round(target*100)}% FTP.`
@@ -958,14 +959,14 @@ export function decidePowerTarget(rider, route, context = {}) {
   if (energy.exploded) {
     target = 0.50
     rider._recoveringW = false
-    phase = 'explose'
+    logKey = 'explose'
     reason = `Explosion Endurance → ${Math.round(target*100)}% FTP forcé (irréversible).`
   } else {
     if (wBal < WBAL_DROP_BELOW) rider._recoveringW = true
     else if (wBal >= WBAL_RECOVER_EXIT) rider._recoveringW = false
     if (rider._recoveringW) {
       target = Math.min(target, 0.80)
-      phase = 'recup_w'
+      logKey = 'recup_w'
       reason = `Réserve W' basse (${_pct(wBal)}%) → ${Math.round(target*100)}% FTP, je récupère jusqu'à ${Math.round(WBAL_RECOVER_EXIT*100)}%.`
     }
   }
@@ -986,7 +987,7 @@ export function decidePowerTarget(rider, route, context = {}) {
   rider.powerFrac = next
   rider.targetZone = getZoneFromFtpRatio(next)     // dérivé pour l'affichage
   rider.aiState = next >= 1.05 ? 'effort_fort' : next >= 0.80 ? 'soutenu' : 'economie'
-  _logPowerDecision(rider, simSec, reason, phase)
+  _logPowerDecision(rider, simSec, reason, logKey)
   return next
 }
 
@@ -1006,17 +1007,18 @@ function _massPowerCeil(mass) {
 const POWER_SMOOTH_UP = 0.15
 const POWER_SMOOTH_DOWN = 0.35
 
-// Journal B1 : une entrée par CHANGEMENT DE PHASE de course (j'attaque la
-// montée, je bascule en récup, je relâche sur le plat final), pas à chaque tick.
-// La déduplication se fait sur `phase` (signature stable : terrain + zone visée)
-// et NON sur `reason`, qui contient des valeurs mouvantes (distance à l'arrivée,
-// % d'endurance) — sinon une simple progression de 0.1 km créait une fausse
-// entrée toutes les ~10 s, sans changement réel de décision.
-function _logPowerDecision(rider, simSec, reason, phase) {
+// Journal B1 : une entrée par CHANGEMENT DE DÉCISION (nouvelle clé). Le coureur
+// ne logue que quand sa décision change vraiment (j'attaque la montée, je
+// bascule en récup, je relâche sur le plat final), pas à chaque tick.
+// La déduplication se fait sur `logKey` (signature stable : terrain + zone visée,
+// ou état C2 : c2:chasse, c2:cale…) et NON sur `reason`, qui contient des valeurs
+// mouvantes (distance à l'arrivée, % d'endurance) — sinon une simple progression
+// de 0.1 km créait une fausse entrée toutes les ~10 s, sans changement réel.
+function _logPowerDecision(rider, simSec, reason, logKey) {
   if (!rider.aiLog) rider.aiLog = []
   const last = rider.aiLog[rider.aiLog.length - 1]
-  if (!last || last.phase !== phase) {
-    rider.aiLog.push({ simSec: simSec ?? null, zone: rider.targetZone, aiState: rider.aiState, reason, phase })
+  if (!last || last.logKey !== logKey) {
+    rider.aiLog.push({ simSec: simSec ?? null, zone: rider.targetZone, aiState: rider.aiState, reason, logKey })
     if (rider.aiLog.length > AI_LOG_MAX_ENTRIES) rider.aiLog.shift()
   }
 }

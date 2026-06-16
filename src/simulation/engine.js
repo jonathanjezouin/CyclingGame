@@ -572,6 +572,33 @@ export function gapToGroupAhead(rider, groups) {
 }
 
 /**
+ * Coureur le plus proche DEVANT `rider` sur la spline (couche 2).
+ *
+ * Primitive purement LONGITUDINALE : on ignore l'offset latéral et la notion
+ * de groupe. Le coureur cherche « la roue devant », proche ou éloignée, tant
+ * qu'elle existe — c'est l'objectif vers lequel il peut décider de fournir un
+ * effort (revenir / rester accroché), justifié par l'abri qu'il en tirera une
+ * fois la jonction faite. Le caractère « atteignable » n'est pas tranché ici :
+ * c'est l'arbitrage de coût (decidePowerTarget) qui décide si ça vaut la peine.
+ *
+ * @param {Object} rider  - expose `splinePos`, `id`
+ * @param {Array}  riders - tous les coureurs
+ * @returns {{ rider: Object, gap: number } | null} la roue devant + écart (m),
+ *          ou null si `rider` est en tête de course.
+ */
+export function nearestRiderAhead(rider, riders) {
+  let best = null
+  let bestGap = Infinity
+  for (const r of riders) {
+    if (r.id === rider.id) continue
+    const gap = r.splinePos - rider.splinePos
+    if (gap <= 0) continue            // pas devant
+    if (gap < bestGap) { bestGap = gap; best = r }
+  }
+  return best ? { rider: best, gap: bestGap } : null
+}
+
+/**
  * Prochain « moment décisif » pour `rider`, selon son profil IA (PBI v1.1, §2) :
  *  - grimpeur            → sommet de la prochaine montée
  *  - rouleur / équipier  → début de la prochaine portion de plat
@@ -643,6 +670,37 @@ const WBAL_RAISE_ABOVE = 0.40  // au-dessus → autorisé à viser plus haut à 
 // Engagement minimum : une zone choisie est tenue ce nombre de ticks (s) avant
 // qu'une nouvelle MONTÉE de zone soit permise (une baisse d'urgence passe outre).
 const ZONE_COMMIT_TICKS = 5
+
+// ─── Couche 2 — le coureur dans le flux (abri ambiant) ──────────────────────
+// C1 produit une cible solo (frac_solo) ; C2 la RÉINTERPRÈTE à la lumière de
+// l'abri disponible — sans choix de roue, sans réaction sociale, sans latéral.
+// Deux usages de l'économie d'abri : la convertir en VITESSE (suivre une roue
+// rapide qui le vaut) ou en ÉPARGNE (se caler dans une roue plus lente pour
+// garder du jus). Le seul garde-fou est le budget global ; la sécurité (W'/
+// explosion) garde le dernier mot et tranche par le bas (bloc suivant).
+const C2_MAX_OVERSPEED = 0.18   // surcoût max (frac) qu'on s'autorise pour tenir une roue
+const C2_MAX_SAVING     = 0.12  // sous-effort max (frac) qu'on s'autorise en se calant
+const C2_CHASE_MAX_GAP_M = 120  // au-delà, une roue isolée n'est plus une cible d'effort
+const C2_VALUE_GATE     = 0.04  // valeur d'abri prospective minimale pour agir
+// Valeur prospective de l'abri : combien l'abri RESTANT vaut, pondéré par le
+// terrain à venir (plat → fort, montée → quasi nul via le facteur v² du draft)
+// et par la réversibilité (lâché sur le plat = définitif → agir plus tôt).
+function _shelterValueAhead(route, splinePos, distanceToFinish) {
+  if (!route) return 0
+  const horizon = Math.min(distanceToFinish, 12000)   // on regarde ~12 km devant
+  if (horizon <= 0) return 0
+  const flats   = (typeof upcomingFlats   === 'function' ? upcomingFlats(route, splinePos)   : []) || []
+  const ascentsL = (typeof upcomingAscents === 'function' ? upcomingAscents(route, splinePos) : []) || []
+  // Mètres de plat (abri utile) vs mètres de montée (abri quasi nul) dans l'horizon.
+  const flatM = flats.reduce((s, f) => s + Math.max(0, Math.min(f.to, splinePos + horizon) - Math.max(f.from, splinePos)), 0)
+  const climbM = ascentsL.reduce((s, a) => s + Math.max(0, Math.min(a.to, splinePos + horizon) - Math.max(a.from, splinePos)), 0)
+  // Fraction de l'horizon où l'abri paiera réellement.
+  const usefulRatio = Math.max(0, Math.min(1, (flatM) / horizon))
+  // Réversibilité : si ce qui reste est surtout plat, perdre la roue est
+  // difficilement récupérable → la valeur monte (on défend plus tôt).
+  const irrecoverable = flatM > climbM ? 1.15 : 0.9
+  return usefulRatio * irrecoverable
+}
 
 // Plafond de zone selon la masse en montée : plus lourd = plafond plus bas.
 // (IA Couches v0.1 §9.1 — « on plafonne selon mass »).
@@ -794,6 +852,61 @@ export function decidePowerTarget(rider, route, context = {}) {
       phase = `plat:z${getZoneFromFtpRatio(target)}`
       reason = `Plat/faux-plat → croisière ${Math.round(target*100)}% FTP ` +
                `(arrivée à ${(distanceToFinish/1000).toFixed(1)} km).`
+    }
+  }
+
+  // ── Couche 2 — réinterprétation par l'abri ambiant ──────────────────────
+  // C1 a posé une cible solo. S'il y a une roue devant ET que l'abri prospectif
+  // le vaut, on ajuste : pousser pour la tenir/revenir (vitesse), ou se caler
+  // plus doucement derrière (épargne). Aucun choix de roue, aucune intention
+  // prêtée à autrui — la roue est un point mobile avec un écart qui évolue.
+  const fracSolo = target
+  const riders = context.riders
+  if (riders && riders.length > 1 && !energy.exploded) {
+    const ahead = nearestRiderAhead(rider, riders)
+    const shelterVal = _shelterValueAhead(route, rider.splinePos, distanceToFinish)
+    if (ahead && shelterVal >= C2_VALUE_GATE && ahead.gap <= C2_CHASE_MAX_GAP_M) {
+      // Dynamique de l'écart : se creuse (>0) ou se réduit (<0) ? Dérivé sur 2 ticks.
+      const prevGap = rider._prevGapAhead
+      const dGap = Number.isFinite(prevGap) ? (ahead.gap - prevGap) : 0
+      rider._prevGapAhead = ahead.gap
+
+      // Rattrapabilité : proche et/ou revient → forte ; loin et s'éloigne → faible.
+      const proximity = 1 - Math.min(1, ahead.gap / C2_CHASE_MAX_GAP_M)
+      const closing   = dGap < 0 ? 1 : dGap > 0 ? 0.4 : 0.7   // s'éloigne = moins rentable
+      const drive     = shelterVal * proximity * closing      // 0..~1.15
+
+      // Budget global : fraction soutenable jusqu'à l'arrivée (même logique que
+      // §6.4) — borne l'overspeed. En montée on ne touche pas (l'abri n'y paie
+      // pas et le budget W' de C1 prime).
+      if (gradient < 2) {
+        if (ahead.gap > 8) {
+          // Roue devant pas encore prise : on accepte de pousser pour revenir /
+          // tenir, proportionnellement à la valeur. Plafonné par l'endurance.
+          const endFrac = energy.endurance.current / energy.endurance.max
+          const budgetRoom = Math.max(0, endFrac - 0.15)        // garde 15% de marge
+          const over = Math.min(C2_MAX_OVERSPEED, C2_MAX_OVERSPEED * drive) * Math.min(1, budgetRoom * 3)
+          if (over > 0.005) {
+            target = fracSolo + over
+            reason = `Roue devant à ${Math.round(ahead.gap)} m${dGap<0?' (je reviens)':dGap>0?' (elle file)':''} → ` +
+                     `+${Math.round(over*100)}% pour l'abri (val ${shelterVal.toFixed(2)}).`
+          }
+        } else {
+          // Déjà dans/juste derrière la roue (abri effectif) : on peut SE CALER
+          // plus doucement — même vitesse pour moins de watts. On épargne tant
+          // qu'il reste du parcours où dépenser ce jus (sinon C1 final reprend).
+          const ascentsLeft = upcomingAscents(route, rider.splinePos).length
+          const finishingSoon = ascentsLeft === 0 && distanceToFinish < 6000
+          if (!finishingSoon && fracSolo > 0.70) {
+            const save = Math.min(C2_MAX_SAVING, C2_MAX_SAVING * shelterVal)
+            target = fracSolo - save
+            reason = `Dans la roue (abri) → je me cale à ${Math.round(target*100)}% FTP ` +
+                     `(j'économise ${Math.round(save*100)}%, abri val ${shelterVal.toFixed(2)}).`
+          }
+        }
+      }
+    } else {
+      rider._prevGapAhead = ahead ? ahead.gap : undefined
     }
   }
 

@@ -419,3 +419,31 @@ describe('Hystérésis de récupération W\' (anti-girouette)', () => {
     expect(maxJump).toBeLessThan(0.15)   // aucun claquement 113%→80% par tick
   })
 })
+
+// ─── Journal B1 : dédup sur la phase, pas sur le texte (fix log périodique) ───
+describe('Journal de raisonnement — déduplication par phase', () => {
+  const flat = { getGradientAt: () => 0, totalLength: 50000, segments: [] }
+
+  it('n\'ajoute pas d\'entrée quand seule la distance change (même phase)', () => {
+    const r = createAIRider({ aiProfile: 'grimpeur', splinePos: 0 })
+    r.speedKmh = 35
+    // 200 ticks de plat : la distance à l'arrivée défile, mais la décision (plat,
+    // ~78% FTP) ne change pas → le journal ne doit PAS gonfler.
+    for (let i = 0; i < 200; i++) {
+      decidePowerTarget(r, flat, { simSec: i })
+      r.splinePos += 10   // avance de 10 m/tick
+    }
+    expect(r.aiLog.length).toBeLessThanOrEqual(2)
+  })
+
+  it('ajoute une entrée à un vrai changement de phase (plat → montée)', () => {
+    const r = createAIRider({ aiProfile: 'grimpeur', splinePos: 0 })
+    r.speedKmh = 30
+    decidePowerTarget(r, flat, { simSec: 0 })
+    const n0 = r.aiLog.length
+    r.speedKmh = 16
+    const climb = { getGradientAt: () => 7, totalLength: 50000, segments: [{ from: 0, to: 12000, type: 'hc_climb' }] }
+    for (let i = 1; i < 10; i++) decidePowerTarget(r, climb, { simSec: i })
+    expect(r.aiLog.length).toBeGreaterThan(n0)
+  })
+})

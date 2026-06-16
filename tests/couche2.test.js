@@ -109,7 +109,8 @@ describe('Couche 2 — se cale dans la roue pour épargner quand du parcours res
   it('juste derrière une roue, loin de l\'arrivée → effort INFÉRIEUR au solo', () => {
     const route = flatRoute()
     const me = mkRider({ splinePos: 1000 }); me.id = 'me'
-    const ahead = mkRider({ splinePos: 1004 }); ahead.id = 'ahead' // 4 m → abri effectif
+    me.screenCount = 3            // abri effectif reçu → rouler moins cher à v égale
+    const ahead = mkRider({ splinePos: 1004 }); ahead.id = 'ahead' // 4 m → calé
     const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'
     const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
     const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
@@ -220,5 +221,34 @@ describe('Couche 2 — composition avec C1', () => {
     decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
     // Cible forcée à 0.50 (lissée) — pas de relance pour la roue.
     expect(me.powerFrac).toBeLessThan(0.80)
+  })
+})
+
+// ─── C2 — calage sans dépassement + journal des décisions ───────────────────
+describe('Couche 2 — calage derrière la roue (pas de faux relais)', () => {
+  it('calé derrière → ne vise jamais au-dessus du solo (anti-dépassement)', () => {
+    const route = flatRoute()
+    const me = mkRider({ splinePos: 1000 }); me.id = 'me'
+    me.screenCount = 2
+    const ahead = mkRider({ splinePos: 1003 }); ahead.id = 'ahead' // collé
+    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'
+    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
+    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    expect(frac).toBeLessThanOrEqual(fracSolo + 1e-9)
+  })
+
+  it('journalise une transition d\'état C2 (chasse → calage)', () => {
+    const route = flatRoute()
+    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 35
+    me.aiLog = []
+    let ahead = mkRider({ splinePos: 1030 }); ahead.id = 'ahead'   // 30 m → chasse
+    decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    const phasesChase = me.aiLog.map(e => e.phase).join(' ')
+    me.screenCount = 3
+    ahead = mkRider({ splinePos: 1004 }); ahead.id = 'ahead'       // 4 m → calage
+    decidePowerTarget(me, route, { simSec: 12, riders: [me, ahead] })
+    const lastPhase = me.aiLog[me.aiLog.length - 1].phase
+    expect(phasesChase).toMatch(/c2:(chasse|jonction)/)
+    expect(lastPhase).toMatch(/c2:(cale|epargne)/)
   })
 })

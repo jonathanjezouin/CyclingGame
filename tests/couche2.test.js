@@ -128,7 +128,69 @@ describe('Couche 2 — se cale dans la roue pour épargner quand du parcours res
   })
 })
 
-// ─── C2 — composition propre avec C1 (inertie, sécurité) ────────────────────
+// ─── C2 — jonction bon marché (recoller un petit trou, vite) ────────────────
+describe('Couche 2 — jonction bon marché : recoller un petit trou', () => {
+  it('petit trou (~13 m) à rythme modeste → grosse relance pour recoller', () => {
+    const route = flatRoute()
+    // Le lissage (POWER_SMOOTH_UP) étale la hausse sur ~5 s : on simule quelques
+    // ticks de décision pour observer la cible de jonction se matérialiser.
+    const me = mkRider({ splinePos: 1000, endRatio: 1 }); me.id = 'me'; me.speedKmh = 35
+    const ahead = mkRider({ splinePos: 1013 }); ahead.id = 'ahead' // 13 m
+    const solo = mkRider({ splinePos: 1000, endRatio: 1 }); solo.id = 'solo'; solo.speedKmh = 35
+    let fSolo = 0, fMe = 0
+    for (let t = 0; t < 8; t++) {
+      fSolo = decidePowerTarget(solo, route, { simSec: 10 + t })
+      fMe = decidePowerTarget(me, route, { simSec: 10 + t, riders: [me, ahead] })
+    }
+    // Après convergence, la jonction tire l'intensité nettement au-dessus du solo.
+    expect(fMe).toBeGreaterThan(fSolo + 0.10)
+  })
+
+  it('jonction appliquée même si l\'abri prospectif est faible (terrain montagneux devant)', () => {
+    // Horizon dominé par la montée → shelterVal sous le gate de valeur, mais la
+    // jonction bon marché s'applique quand même (gradient courant plat).
+    const route = {
+      getGradientAt: (p) => (p < 1100 ? 0 : 6),   // plat ici, montée juste après
+      totalLength: 50000,
+      segments: [
+        { from: 0, to: 1100, type: 'flat' },
+        { from: 1100, to: 50000, type: 'climb' },
+      ],
+    }
+    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 35
+    const ahead = mkRider({ splinePos: 1015 }); ahead.id = 'ahead'
+    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'; solo.speedKmh = 35
+    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
+    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    expect(frac).toBeGreaterThan(fracSolo)
+  })
+
+  it('jonction bornée par le budget : endurance basse → relance atténuée', () => {
+    const route = flatRoute()
+    const full = mkRider({ splinePos: 1000, endRatio: 1 }); full.id = 'full'; full.speedKmh = 35
+    const low  = mkRider({ splinePos: 1000, endRatio: 0.18 }); low.id = 'low'; low.speedKmh = 35
+    const aheadF = mkRider({ splinePos: 1013 }); aheadF.id = 'aF'
+    const aheadL = mkRider({ splinePos: 1013 }); aheadL.id = 'aL'
+    const overFull = decidePowerTarget(full, route, { simSec: 10, riders: [full, aheadF] })
+    const overLow  = decidePowerTarget(low,  route, { simSec: 10, riders: [low, aheadL] })
+    // À budget large, on pousse plus fort qu'à budget serré.
+    expect(overFull).toBeGreaterThan(overLow)
+  })
+
+  it('grand trou (au-delà du seuil jonction) → pas de jonction bon marché', () => {
+    // 80 m > C2_JOIN_GAP_M : seul le terme "valeur" peut jouer, pas la jonction.
+    const route = flatRoute()
+    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 35
+    const ahead = mkRider({ splinePos: 1080 }); ahead.id = 'ahead'
+    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    // Sur le plat, le terme valeur s'applique mais reste modéré (pas de +22%).
+    // On vérifie surtout qu'on ne déclenche pas la grosse relance de jonction.
+    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'; solo.speedKmh = 35
+    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
+    expect(frac - fracSolo).toBeLessThan(0.18)
+  })
+})
+
 describe('Couche 2 — composition avec C1', () => {
   it('inerte sans riders dans le contexte (rétro-compat couche 1)', () => {
     const route = flatRoute()

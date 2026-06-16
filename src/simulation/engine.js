@@ -681,7 +681,14 @@ const ZONE_COMMIT_TICKS = 5
 const C2_MAX_OVERSPEED = 0.18   // surcoût max (frac) qu'on s'autorise pour tenir une roue
 const C2_MAX_SAVING     = 0.12  // sous-effort max (frac) qu'on s'autorise en se calant
 const C2_CHASE_MAX_GAP_M = 120  // au-delà, une roue isolée n'est plus une cible d'effort
-const C2_VALUE_GATE     = 0.04  // valeur d'abri prospective minimale pour agir
+const C2_VALUE_GATE     = 0.04  // valeur d'abri prospective minimale pour la chasse "valeur"
+// Jonction bon marché : si une petite hausse suffit à recoller un trou modeste,
+// on la prend SANS arbitrer la valeur d'abri (combler 13 m à rythme tranquille
+// coûte quelques secondes de watts — un vrai coureur ne calcule pas ça). On vise
+// une fermeture RAPIDE. Borné par C2_JOIN_MAX et par le budget d'endurance.
+const C2_JOIN_GAP_M     = 40    // trou ≤ ce seuil → éligible jonction bon marché
+const C2_JOIN_CLOSE_SEC = 4     // horizon de fermeture visé (rapide)
+const C2_JOIN_MAX       = 0.22  // surcoût max (frac) concédé pour une jonction
 // Valeur prospective de l'abri : combien l'abri RESTANT vaut, pondéré par le
 // terrain à venir (plat → fort, montée → quasi nul via le facteur v² du draft)
 // et par la réversibilité (lâché sur le plat = définitif → agir plus tôt).
@@ -865,33 +872,54 @@ export function decidePowerTarget(rider, route, context = {}) {
   if (riders && riders.length > 1 && !energy.exploded) {
     const ahead = nearestRiderAhead(rider, riders)
     const shelterVal = _shelterValueAhead(route, rider.splinePos, distanceToFinish)
-    if (ahead && shelterVal >= C2_VALUE_GATE && ahead.gap <= C2_CHASE_MAX_GAP_M) {
+    // On agit dès qu'une roue est à portée de chasse. Le gate de valeur d'abri
+    // ne conditionne plus QUE le terme "valeur" (chasse longue / épargne) :
+    // la jonction bon marché, elle, s'applique largement (cf. ci-dessous).
+    if (ahead && ahead.gap <= C2_CHASE_MAX_GAP_M) {
       // Dynamique de l'écart : se creuse (>0) ou se réduit (<0) ? Dérivé sur 2 ticks.
       const prevGap = rider._prevGapAhead
       const dGap = Number.isFinite(prevGap) ? (ahead.gap - prevGap) : 0
       rider._prevGapAhead = ahead.gap
 
-      // Rattrapabilité : proche et/ou revient → forte ; loin et s'éloigne → faible.
-      const proximity = 1 - Math.min(1, ahead.gap / C2_CHASE_MAX_GAP_M)
-      const closing   = dGap < 0 ? 1 : dGap > 0 ? 0.4 : 0.7   // s'éloigne = moins rentable
-      const drive     = shelterVal * proximity * closing      // 0..~1.15
-
-      // Budget global : fraction soutenable jusqu'à l'arrivée (même logique que
-      // §6.4) — borne l'overspeed. En montée on ne touche pas (l'abri n'y paie
-      // pas et le budget W' de C1 prime).
+      // En montée on ne touche pas (l'abri n'y paie pas, le budget W' de C1 prime).
       if (gradient < 2) {
+        const endFrac = energy.endurance.current / energy.endurance.max
+        const budgetRoom = Math.max(0, endFrac - 0.15)        // garde 15% de marge
+        const budgetGate = Math.min(1, budgetRoom * 3)
+
         if (ahead.gap > 8) {
-          // Roue devant pas encore prise : on accepte de pousser pour revenir /
-          // tenir, proportionnellement à la valeur. Plafonné par l'endurance.
-          const endFrac = energy.endurance.current / energy.endurance.max
-          const budgetRoom = Math.max(0, endFrac - 0.15)        // garde 15% de marge
-          const over = Math.min(C2_MAX_OVERSPEED, C2_MAX_OVERSPEED * drive) * Math.min(1, budgetRoom * 3)
+          // (a) JONCTION BON MARCHÉ — appliquée largement, indépendamment de la
+          //     valeur d'abri. Si une petite hausse referme le trou vite, on la
+          //     prend. Coût ≈ Δvitesse nécessaire pour combler `gap` en
+          //     C2_JOIN_CLOSE_SEC, traduit grossièrement en fraction de FTP.
+          let joinOver = 0
+          if (ahead.gap <= C2_JOIN_GAP_M) {
+            const vMs = Math.max(3, (rider.speedKmh ?? 0) / 3.6)
+            // Sur-vitesse requise pour fermer `gap` en CLOSE_SEC (m/s), rapportée
+            // à la vitesse courante → surplus de puissance ~ proportionnel.
+            const extraVMs = ahead.gap / C2_JOIN_CLOSE_SEC
+            const fracBump = extraVMs / vMs                    // ~Δv/v ≈ Δfrac (approx)
+            joinOver = Math.min(C2_JOIN_MAX, fracBump) * budgetGate
+          }
+
+          // (b) CHASSE "VALEUR" — investissement justifié par l'abri prospectif,
+          //     pour les trous plus larges. Conditionnée au gate de valeur.
+          let valueOver = 0
+          if (shelterVal >= C2_VALUE_GATE) {
+            const proximity = 1 - Math.min(1, ahead.gap / C2_CHASE_MAX_GAP_M)
+            const closing   = dGap < 0 ? 1 : dGap > 0 ? 0.4 : 0.7
+            const drive     = shelterVal * proximity * closing
+            valueOver = Math.min(C2_MAX_OVERSPEED, C2_MAX_OVERSPEED * drive) * budgetGate
+          }
+
+          const over = Math.max(joinOver, valueOver)
           if (over > 0.005) {
             target = fracSolo + over
+            const tag = joinOver >= valueOver ? 'jonction' : 'abri'
             reason = `Roue devant à ${Math.round(ahead.gap)} m${dGap<0?' (je reviens)':dGap>0?' (elle file)':''} → ` +
-                     `+${Math.round(over*100)}% pour l'abri (val ${shelterVal.toFixed(2)}).`
+                     `+${Math.round(over*100)}% (${tag}${tag==='abri'?` val ${shelterVal.toFixed(2)}`:''}).`
           }
-        } else {
+        } else if (shelterVal >= C2_VALUE_GATE) {
           // Déjà dans/juste derrière la roue (abri effectif) : on peut SE CALER
           // plus doucement — même vitesse pour moins de watts. On épargne tant
           // qu'il reste du parcours où dépenser ce jus (sinon C1 final reprend).

@@ -8,10 +8,10 @@
       <button class="rc-close" @click="$emit('close')">✕</button>
     </div>
 
-    <!-- Attitude actuelle : effortMode + aiState -->
+    <!-- Attitude actuelle : zone cible + état dérivé -->
     <div class="rc-badges">
-      <span class="rc-badge" :style="{ borderColor: effortInfo.color, color: effortInfo.color }">
-        {{ effortInfo.label }}
+      <span class="rc-badge" :style="{ borderColor: zoneInfo.color, color: zoneInfo.color }">
+        {{ zoneInfo.label }} · {{ zoneInfo.name }}
       </span>
       <span v-if="rider.isPlayer" class="rc-badge rc-badge-muted">Joueur</span>
       <span v-else class="rc-badge" :style="{ borderColor: stateInfo.color, color: stateInfo.color }">
@@ -69,7 +69,7 @@
           <div class="rc-log-meta">
             <span class="rc-log-time">{{ formatSimTime(entry.simSec) }}</span>
             <span class="rc-log-state" :style="{ color: (AI_STATE_INFO[entry.aiState] ?? {}).color }">
-              {{ (AI_STATE_INFO[entry.aiState] ?? {}).label ?? entry.aiState }}
+              {{ zoneLabel(entry.zone) }} · {{ (AI_STATE_INFO[entry.aiState] ?? {}).label ?? entry.aiState }}
             </span>
           </div>
           <div class="rc-log-reason">{{ entry.reason }}</div>
@@ -81,7 +81,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { EFFORT_MODES, AI_STATES } from '../simulation/engine.js'
+import { ZONES } from '../simulation/engine.js'
 
 const props = defineProps({
   rider: { type: Object, required: true },
@@ -93,8 +93,8 @@ defineEmits(['close'])
 const PROFILE_LABELS = {
   grimpeur:  'Grimpeur',
   rouleur:   'Rouleur',
+  puncheur:  'Puncheur',
   sprinteur: 'Sprinteur',
-  equipier:  'Équipier',
 }
 
 const GROUP_LABELS = {
@@ -104,14 +104,15 @@ const GROUP_LABELS = {
   retardataires:  'Retardataires',
 }
 
-// Libellés/couleurs des aiState — miroir de AI_STATES (engine.js), pour le
-// badge d'attitude et le journal de raisonnement.
+// États dérivés de la zone cible (couche 1) — aiState est désormais un libellé
+// d'intensité ('economie' / 'soutenu' / 'effort_fort'), pas une machine d'état.
 const AI_STATE_INFO = {
-  [AI_STATES.FOLLOWING]:  { label: 'Suit le groupe', color: '#60a5fa' },
-  [AI_STATES.ATTACKING]:  { label: 'Attaque',        color: '#ef4444' },
-  [AI_STATES.RECOVERING]: { label: 'Récupère',       color: '#fbbf24' },
-  [AI_STATES.EXPLODED]:   { label: 'Explosé',        color: '#7c3aed' },
+  economie:    { label: 'Économie',   color: '#34d399' },
+  soutenu:     { label: 'Soutenu',    color: '#fbbf24' },
+  effort_fort: { label: 'Gros effort', color: '#ef4444' },
 }
+
+const _zoneById = (id) => Object.values(ZONES).find(z => z.id === id)
 
 const profileLabel = computed(() =>
   props.rider.isPlayer ? 'Toi' : (PROFILE_LABELS[props.rider.aiProfile] ?? props.rider.aiProfile ?? '—')
@@ -119,11 +120,16 @@ const profileLabel = computed(() =>
 
 const groupLabel = computed(() => GROUP_LABELS[props.rider.group] ?? props.rider.group ?? '—')
 
-const effortInfo = computed(() => EFFORT_MODES[props.rider.effortMode] ?? EFFORT_MODES.maintien)
+// Badge d'attitude : la zone cible courante du coureur.
+const zoneInfo = computed(() => _zoneById(props.rider.targetZone) ?? ZONES.Z3)
 
 const stateInfo = computed(() =>
-  AI_STATE_INFO[props.rider.aiState] ?? AI_STATE_INFO[AI_STATES.FOLLOWING]
+  AI_STATE_INFO[props.rider.aiState] ?? AI_STATE_INFO.soutenu
 )
+
+function zoneLabel(zoneId) {
+  return _zoneById(zoneId)?.label ?? `Z${zoneId}`
+}
 
 // ─── Jauges ──────────────────────────────────────────────────────────────────
 const endurancePct = computed(() => {

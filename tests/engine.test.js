@@ -163,14 +163,14 @@ describe('simulateTick — avancement', () => {
     expect(r.splinePos).toBeLessThanOrEqual(5)
   })
 
-  it('mode attaque soutenu place en Z5 (pas Z6)', () => {
-    const r = createRider({ effortMode: 'attaque' })
+  it('zone cible 5 place le coureur en Z5', () => {
+    const r = createRider({ targetZone: 5 })
     simulateTick(r, flatRoute, 1)
     expect(r.energy.zone).toBe(5)
   })
 
   it('défaillance W\' bride la puissance → vitesse réduite', () => {
-    const r = createRider({ effortMode: 'attaque' })
+    const r = createRider({ targetZone: 5 })
     r.energy.wFailTicks = 5
     simulateTick(r, flatRoute, 1)
     // En crampe, la zone retombe en aérobie (≤ Z3)

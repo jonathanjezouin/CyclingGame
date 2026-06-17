@@ -367,6 +367,31 @@ export function computeSpeed(powerWatts, gradientPercent, windKmh = 0, draftFact
 }
 
 // ─── Aspiration / draft ──────────────────────────────────────────────────────
+
+/**
+ * Puissance (W) nécessaire pour tenir une vitesse cible, à pente/draft donnés.
+ * Inverse de computeSpeed : la puissance est explicite en fonction de v, donc
+ * pas de dichotomie. Sert à la couche 2 — convertir « la vitesse de la roue
+ * devant » en une cible d'intensité (fraction de FTP) comparable à l'instinct C1.
+ *
+ * @param {number} speedKmh       - vitesse cible (km/h)
+ * @param {number} gradientPercent
+ * @param {number} draftFactor    - 1 = pas d'abri ; <1 = CdA réduit par le draft
+ * @param {number} massKg
+ * @returns {number} puissance en watts
+ */
+export function powerForSpeed(speedKmh, gradientPercent, draftFactor = 1, massKg = PHYSICS.mass) {
+  const { rho, g, Crr } = PHYSICS
+  const mass = massKg ?? PHYSICS.mass
+  const CdA = (Math.abs(gradientPercent) > 3 ? PHYSICS.CdA_climb : PHYSICS.CdA_flat) * draftFactor
+  const gradient = gradientPercent / 100
+  const v = Math.max(0.1, speedKmh / 3.6)
+  const pAero = 0.5 * CdA * rho * v * v * v
+  const pPente = mass * g * Math.sin(Math.atan(gradient)) * v
+  const pRoul = Crr * mass * g * v
+  return Math.max(0, pAero + pPente + pRoul)
+}
+
 /**
  * Réduction aérodynamique due au draft.
  * Modèle frontal plafonné (TDD v0.5 §4bis.3) :
@@ -672,47 +697,25 @@ const WBAL_RAISE_ABOVE = 0.40  // au-dessus → autorisé à viser plus haut à 
 const ZONE_COMMIT_TICKS = 5
 
 // ─── Couche 2 — le coureur dans le flux (abri ambiant) ──────────────────────
-// C1 produit une cible solo (frac_solo) ; C2 la RÉINTERPRÈTE à la lumière de
-// l'abri disponible — sans choix de roue, sans réaction sociale, sans latéral.
-// Deux usages de l'économie d'abri : la convertir en VITESSE (suivre une roue
-// rapide qui le vaut) ou en ÉPARGNE (se caler dans une roue plus lente pour
-// garder du jus). Le seul garde-fou est le budget global ; la sécurité (W'/
-// explosion) garde le dernier mot et tranche par le bas (bloc suivant).
-const C2_MAX_OVERSPEED = 0.18   // surcoût max (frac) qu'on s'autorise pour tenir une roue
-const C2_MAX_SAVING     = 0.12  // sous-effort max (frac) qu'on s'autorise en se calant
-const C2_CHASE_MAX_GAP_M = 150  // au-delà, une roue isolée n'est plus une cible d'effort
-const C2_VALUE_GATE     = 0.04  // valeur d'abri prospective minimale pour la chasse "valeur"
-// Jonction bon marché : si une hausse raisonnable suffit à recoller un trou,
-// on la prend SANS arbitrer la valeur d'abri (combler le trou à rythme tranquille
-// coûte quelques secondes de watts — un vrai coureur ne calcule pas ça). On vise
-// une fermeture RAPIDE. Borné par C2_JOIN_MAX et par le budget d'endurance.
-const C2_JOIN_GAP_M     = 60    // trou ≤ ce seuil → éligible jonction bon marché
-const C2_JOIN_CLOSE_SEC = 4     // horizon de fermeture visé (rapide)
-const C2_JOIN_MAX       = 0.30  // surcoût max (frac) concédé pour une jonction
-// Bande de "calage derrière la roue" : une fois le trou refermé, le coureur se
-// place DERRIÈRE et tient la position — il ne cherche pas à dépasser (sinon les
-// deux coureurs se doublent alternativement → faux relais).
-const C2_SETTLE_GAP_M   = 10    // gap ≤ ce seuil → on est "dans la roue", on se cale
-const C2_SETTLE_HOLD_M  = 4     // gap cible idéal derrière la roue (m)
-// Valeur prospective de l'abri : combien l'abri RESTANT vaut, pondéré par le
-// terrain à venir (plat → fort, montée → quasi nul via le facteur v² du draft)
-// et par la réversibilité (lâché sur le plat = définitif → agir plus tôt).
-function _shelterValueAhead(route, splinePos, distanceToFinish) {
-  if (!route) return 0
-  const horizon = Math.min(distanceToFinish, 12000)   // on regarde ~12 km devant
-  if (horizon <= 0) return 0
-  const flats   = (typeof upcomingFlats   === 'function' ? upcomingFlats(route, splinePos)   : []) || []
-  const ascentsL = (typeof upcomingAscents === 'function' ? upcomingAscents(route, splinePos) : []) || []
-  // Mètres de plat (abri utile) vs mètres de montée (abri quasi nul) dans l'horizon.
-  const flatM = flats.reduce((s, f) => s + Math.max(0, Math.min(f.to, splinePos + horizon) - Math.max(f.from, splinePos)), 0)
-  const climbM = ascentsL.reduce((s, a) => s + Math.max(0, Math.min(a.to, splinePos + horizon) - Math.max(a.from, splinePos)), 0)
-  // Fraction de l'horizon où l'abri paiera réellement.
-  const usefulRatio = Math.max(0, Math.min(1, (flatM) / horizon))
-  // Réversibilité : si ce qui reste est surtout plat, perdre la roue est
-  // difficilement récupérable → la valeur monte (on défend plus tôt).
-  const irrecoverable = flatM > climbM ? 1.15 : 0.9
-  return usefulRatio * irrecoverable
-}
+// Arbitrage UNIQUE par les vitesses (pas de cas spécial montée, pas de régimes
+// par distance). À chaque tick le coureur compare DEUX vitesses de référence :
+//   • sa vitesse "instinct" C1 (ce qu'il ferait seul, dérivée de fracSolo) ;
+//   • la vitesse de la roue/groupe devant.
+// Il calcule le BÉNÉFICE NET de prendre la vitesse du groupe = économie d'abri
+// (qui dépend de la vitesse → fond en montée via le facteur v²) MOINS l'inconfort
+// d'être hors de son rythme. Si positif → il adopte la vitesse du groupe (et
+// réagit vite à ses accélérations, d'autant plus vite qu'il est frais). Sinon →
+// il roule à son instinct C1, et DÉBORDE mécaniquement s'il va réellement plus
+// vite. Le comportement terrain (grimpeur qui lâche la roue en côte, calage sur
+// le plat) ÉMERGE de cet arbitrage — aucune règle si-pente.
+const C2_FOLLOW_DIST_M    = 2.0   // distance de suivi cible derrière la roue (~1 longueur + jeu)
+const C2_IN_WHEEL_GAP_M   = 12    // au-delà, je ne suis plus "dans la roue" : je dois revenir
+const C2_CHASE_MAX_GAP_M  = 150   // au-delà, une roue isolée n'est plus une cible
+const C2_REACT_UP         = 0.40  // réactivité à une accélération de la roue (frais)
+const C2_REACT_W_FATIGUE  = 0.55  // facteur de réactivité quand le W' est bas (< plus mou)
+const C2_COMFORT_K        = 0.9   // pondère l'inconfort d'être hors de son rythme C1
+const C2_JOIN_CLOSE_SEC   = 4     // horizon de fermeture d'un trou (revenir)
+const C2_MAX_OVERSPEED    = 0.30  // surcoût max (frac) concédé pour revenir/tenir
 
 // Plafond de zone selon la masse en montée : plus lourd = plafond plus bas.
 // (IA Couches v0.1 §9.1 — « on plafonne selon mass »).
@@ -868,80 +871,93 @@ export function decidePowerTarget(rider, route, context = {}) {
     }
   }
 
-  // ── Couche 2 — réinterprétation par l'abri ambiant ──────────────────────
-  // C1 a posé une cible solo. S'il y a une roue devant ET que l'abri prospectif
-  // le vaut, on ajuste : pousser pour la tenir/revenir (vitesse), ou se caler
-  // plus doucement derrière (épargne). Aucun choix de roue, aucune intention
-  // prêtée à autrui — la roue est un point mobile avec un écart qui évolue.
+  // ── Couche 2 — arbitrage unique par les vitesses (abri ambiant) ─────────
+  // C1 a posé l'instinct solo (fracSolo). C2 compare la vitesse de la roue
+  // devant à ma vitesse-instinct et décide : suivre (adopter sa vitesse, abri)
+  // ou rouler à mon rythme (et déborder si je vais vraiment plus vite). Pas de
+  // cas pente : l'abri fond en montée via le facteur v², donc le grimpeur lâche
+  // la roue tout seul. La sécurité (W'/explosion) garde le dernier mot (bloc
+  // suivant) ; on ne touche pas un coureur explosé.
   const fracSolo = target
   const riders = context.riders
   if (riders && riders.length > 1 && !energy.exploded) {
     const ahead = nearestRiderAhead(rider, riders)
-    const shelterVal = _shelterValueAhead(route, rider.splinePos, distanceToFinish)
-    if (ahead && ahead.gap <= C2_CHASE_MAX_GAP_M && gradient < 2) {
-      // Dynamique de l'écart : se creuse (>0) ou se réduit (<0) ? Dérivé sur 2 ticks.
-      const prevGap = rider._prevGapAhead
-      const dGap = Number.isFinite(prevGap) ? (ahead.gap - prevGap) : 0
-      rider._prevGapAhead = ahead.gap
+    if (ahead && ahead.gap <= C2_CHASE_MAX_GAP_M) {
+      const myMass   = rider.profile?.mass
+      const myV      = Math.max(1, rider.speedKmh ?? 1)
+      const wheelV   = Math.max(1, ahead.rider.speedKmh ?? myV)
+      // Vitesse "instinct" C1 : celle que je tiendrais SEUL à fracSolo (sans abri).
+      const ftpW     = energy.ftpWatts * (energy.dayFormMod ?? 1)
+      const soloV    = computeSpeed(fracSolo * ftpW, gradient, 0, 1, myMass)
 
-      const endFrac = energy.endurance.current / energy.endurance.max
-      const budgetRoom = Math.max(0, endFrac - 0.15)        // garde 15% de marge
-      const budgetGate = Math.min(1, budgetRoom * 3)
+      // Économie d'abri SI je roule à la vitesse de la roue : puissance pour
+      // tenir wheelV avec draft vs sans draft. Le draft (donc l'économie) dépend
+      // de la vitesse → fond en montée. C'est tout le ressort du comportement.
+      const draftFrac   = draftReduction(rider.screenCount ?? 0, wheelV) // 0..0.45
+      const pNoDraft    = powerForSpeed(wheelV, gradient, 1, myMass)
+      const pDraft      = powerForSpeed(wheelV, gradient, 1 - draftFrac, myMass)
+      const shelterGain = Math.max(0, (pNoDraft - pDraft) / Math.max(1, ftpW)) // en frac de FTP
 
-      if (ahead.gap > C2_SETTLE_GAP_M) {
-        // ── PAS ENCORE DANS LA ROUE : on RECOLLE ─────────────────────────────
-        // (a) Jonction bon marché — large, indépendante de la valeur d'abri.
-        let joinOver = 0
-        if (ahead.gap <= C2_JOIN_GAP_M) {
-          const vMs = Math.max(3, (rider.speedKmh ?? 0) / 3.6)
-          const extraVMs = ahead.gap / C2_JOIN_CLOSE_SEC
-          joinOver = Math.min(C2_JOIN_MAX, extraVMs / vMs) * budgetGate
-        }
-        // (b) Chasse "valeur" — trous plus larges, justifiés par l'abri prospectif.
-        let valueOver = 0
-        if (shelterVal >= C2_VALUE_GATE) {
-          const proximity = 1 - Math.min(1, ahead.gap / C2_CHASE_MAX_GAP_M)
-          const closing   = dGap < 0 ? 1 : dGap > 0 ? 0.5 : 0.75
-          const drive     = shelterVal * proximity * closing
-          valueOver = Math.min(C2_MAX_OVERSPEED, C2_MAX_OVERSPEED * drive) * budgetGate
-        }
-        const over = Math.max(joinOver, valueOver)
-        if (over > 0.005) {
-          target = fracSolo + over
-          const tag = joinOver >= valueOver ? 'jonction' : 'chasse'
-          logKey = `c2:${tag}`
-          reason = `Roue devant à ${Math.round(ahead.gap)} m${dGap<0?' (je reviens)':dGap>0?' (elle file)':''} → ` +
-                   `+${Math.round(over*100)}% pour recoller${tag==='chasse'?` (abri val ${shelterVal.toFixed(2)})`:''}.`
-        } else if (budgetGate <= 0.01) {
-          logKey = 'c2:lache'
-          reason = `Roue devant à ${Math.round(ahead.gap)} m mais budget épuisé → je laisse filer.`
+      // Inconfort d'être hors de mon rythme : |vitesse de la roue − mon instinct|,
+      // rapporté à mon instinct, pondéré. Suivre une roue trop lente OU trop
+      // rapide coûte ; l'abri doit compenser.
+      const mismatch  = Math.abs(wheelV - soloV) / Math.max(1, soloV)
+      const discomfort = C2_COMFORT_K * mismatch
+
+      const followIsWorth = shelterGain >= discomfort
+
+      // Réactivité : un coureur frais matche vite une accélération ; W' bas = plus mou.
+      const wRatio = energy.wPrime.current / Math.max(1, energy.wPrime.max)
+      const react  = C2_REACT_UP * (wRatio < 0.3 ? C2_REACT_W_FATIGUE : 1)
+
+      if (ahead.gap > C2_IN_WHEEL_GAP_M) {
+        // ── PAS ENCORE DANS LA ROUE ──────────────────────────────────────────
+        // Si la suivre vaut le coup, je reviens : je vise la vitesse de la roue
+        // + le surplus nécessaire pour refermer le trou en ~JOIN_CLOSE_SEC.
+        if (followIsWorth) {
+          const closeVMs = (ahead.gap - C2_FOLLOW_DIST_M) / C2_JOIN_CLOSE_SEC // m/s à rattraper
+          const targetVKmh = wheelV + Math.max(0, closeVMs * 3.6)
+          const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
+          const overFrac = Math.min(C2_MAX_OVERSPEED, Math.max(0, pNeed / ftpW - fracSolo))
+          target = fracSolo + overFrac
+          logKey = 'c2:reviens'
+          reason = `Roue devant à ${Math.round(ahead.gap)} m, ça vaut l'abri → ` +
+                   `+${Math.round(overFrac*100)}% pour revenir (gain abri ${(shelterGain*100).toFixed(0)}%).`
+        } else {
+          // Pas rentable de revenir : je roule à mon instinct.
+          logKey = 'c2:mon_rythme'
+          reason = `Roue devant à ${Math.round(ahead.gap)} m mais peu d'abri ici ` +
+                   `(${(shelterGain*100).toFixed(0)}%) → je roule à mon rythme (${Math.round(fracSolo*100)}% FTP).`
         }
       } else {
-        // ── DANS LA ROUE : on se CALE DERRIÈRE, on ne dépasse pas ─────────────
-        // Si la roue est trop LENTE pour moi (je pourrais tenir bien plus vite
-        // tout seul) ET qu'on approche d'un final sans difficulté → je ne me
-        // bride pas, C1 reprend (envie d'aller plus vite que la roue).
-        const ascentsLeft = upcomingAscents(route, rider.splinePos).length
-        const finishingSoon = ascentsLeft === 0 && distanceToFinish < 6000
-        const wheelTooSlow = finishingSoon && fracSolo > 1.0
-
-        if (wheelTooSlow) {
-          logKey = 'c2:depasse'
-          reason = `Dans la roue mais ça n'avance pas assez (final) → je passe devant (${Math.round(fracSolo*100)}% FTP).`
+        // ── DANS LA ROUE ─────────────────────────────────────────────────────
+        if (followIsWorth) {
+          // Je tiens la roue : cible = SA vitesse (l'abri rend ça moins cher que
+          // mon instinct), + réaction immédiate si elle accélère (le trou s'ouvre,
+          // dGap>0) atténuée par la fatigue, + petite correction de distance de
+          // suivi. On ne vise jamais "passer" : on vise tenir FOLLOW_DIST derrière.
+          const prevGap = rider._prevGapAhead
+          const dGap = Number.isFinite(prevGap) ? (ahead.gap - prevGap) : 0
+          const distErr = ahead.gap - C2_FOLLOW_DIST_M            // >0 = trop loin, je relance un peu
+          const reactKmh = Math.max(0, dGap) * react * 3.6        // réaction à l'accélération
+          const corrKmh  = Math.max(-2, Math.min(4, distErr)) * 0.4
+          const targetVKmh = wheelV + reactKmh + corrKmh
+          const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
+          target = Math.max(0.50, Math.min(1.50, pNeed / ftpW))
+          logKey = 'c2:roue'
+          reason = `Dans la roue (${ahead.gap.toFixed(1)} m) → je tiens sa vitesse ` +
+                   `${wheelV.toFixed(0)} km/h à ${Math.round(target*100)}% FTP` +
+                   `${dGap > 0.3 ? ' (elle accélère, je réagis)' : ''}.`
+          rider._prevGapAhead = ahead.gap
         } else {
-          // Calage : l'économie vient de l'abri RÉELLEMENT reçu (screenCount) —
-          // à vitesse égale, être abrité coûte moins de watts. On part du solo
-          // et on retranche le bénéfice d'abri, borné. Jamais au-dessus du solo
-          // (anti-dépassement). Filet de gaz si je décroche un peu dans la bande.
-          const draft = draftReduction(rider.screenCount ?? 0, rider.speedKmh ?? 0)
-          const save = Math.min(C2_MAX_SAVING, fracSolo * draft)
-          const drift = ahead.gap > C2_SETTLE_HOLD_M + 3 ? 0.03 : 0
-          target = Math.max(fracSolo - save + drift, fracSolo - C2_MAX_SAVING)
-          const epargne = target < fracSolo - 0.015
-          logKey = epargne ? 'c2:epargne' : 'c2:cale'
-          const verb = epargne ? "je me cale et j'économise" : 'je me cale derrière'
-          reason = `Dans la roue (${Math.round(ahead.gap)} m, abri val ${shelterVal.toFixed(2)}) → ` +
-                   `${verb} à ${Math.round(target*100)}% FTP.`
+          // La roue ne vaut plus l'abri (trop lente/rapide pour moi ici, ex.
+          // grimpeur en côte) → je roule à mon rythme. Si soloV > wheelV, je
+          // déborde mécaniquement (légitime, vraie différence de rythme).
+          logKey = soloV > wheelV + 0.5 ? 'c2:deborde' : 'c2:mon_rythme'
+          const verb = soloV > wheelV + 0.5 ? 'je déborde et passe' : 'je roule à mon rythme'
+          reason = `Roue devant peu rentable ici (abri ${(shelterGain*100).toFixed(0)}%, ` +
+                   `inconfort ${(discomfort*100).toFixed(0)}%) → ${verb} (${Math.round(fracSolo*100)}% FTP).`
+          rider._prevGapAhead = ahead.gap
         }
       }
     } else {

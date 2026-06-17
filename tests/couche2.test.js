@@ -70,125 +70,96 @@ describe('nearestRiderAhead — coureur le plus proche devant (longitudinal)', (
 })
 
 // ─── C2 — convertir l'abri en vitesse (revenir / tenir une roue) ────────────
-describe('Couche 2 — pousse pour revenir sur une roue quand l\'abri le vaut', () => {
-  it('sur le plat, une roue devant à portée → effort SUPÉRIEUR au solo', () => {
+
+// ─── C2 — arbitrage par les vitesses : suivre une roue qui vaut l'abri ───────
+describe('Couche 2 — suivre une roue quand l\'abri le vaut (plat)', () => {
+  it('roue devant à portée sur le plat → le coureur RÉAGIT (cible ≠ pur solo)', () => {
     const route = flatRoute()
-    const me = mkRider({ splinePos: 1000, endRatio: 1 }); me.id = 'me'
-    const ahead = mkRider({ splinePos: 1040 }); ahead.id = 'ahead' // 40 m devant
-    // Cible solo de référence (sans personne autour).
-    const solo = mkRider({ splinePos: 1000, endRatio: 1 }); solo.id = 'solo'
+    const me = mkRider({ splinePos: 1000, endRatio: 1 }); me.id = 'me'; me.speedKmh = 38
+    me.screenCount = 2
+    const ahead = mkRider({ splinePos: 1040 }); ahead.id = 'ahead'; ahead.speedKmh = 40
+    const solo = mkRider({ splinePos: 1000, endRatio: 1 }); solo.id = 'solo'; solo.speedKmh = 38
     const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
-    // Avec la roue devant.
     const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    // Une roue plus rapide devant + abri → il pousse pour revenir, au-dessus du solo.
     expect(frac).toBeGreaterThan(fracSolo)
+    expect(me.aiLog[me.aiLog.length - 1].logKey).toMatch(/^c2:/)
   })
 
-  it('en montée, l\'abri ne paie pas → pas de surcoût C2', () => {
+  it('roue trop loin (au-delà du plafond) → pas de C2, on reste au solo', () => {
+    const route = flatRoute()
+    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 38
+    const ahead = mkRider({ splinePos: 1000 + 300 }); ahead.id = 'ahead'; ahead.speedKmh = 40
+    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'; solo.speedKmh = 38
+    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
+    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    expect(frac).toBeCloseTo(fracSolo, 5)
+  })
+})
+
+// ─── C2 — émergence montée : pas de cas spécial, l'abri fond via v² ─────────
+describe('Couche 2 — comportement montée émergent (pas de règle si-pente)', () => {
+  it('en montée raide, l\'abri ne paie quasi plus → cible proche du solo', () => {
     const route = climbRoute()
-    const me = mkRider({ splinePos: 1000 }); me.id = 'me'
-    const ahead = mkRider({ splinePos: 1040 }); ahead.id = 'ahead'
-    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'
+    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 14
+    me.screenCount = 2
+    const ahead = mkRider({ splinePos: 1010 }); ahead.id = 'ahead'; ahead.speedKmh = 14
+    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'; solo.speedKmh = 14
     const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
     const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    expect(frac).toBeCloseTo(fracSolo, 5)
+    // L'abri en col est négligeable : C2 ne tire pas le coureur loin de son instinct.
+    expect(Math.abs(frac - fracSolo)).toBeLessThan(0.10)
   })
 
-  it('roue trop loin (au-delà du plafond de chasse) → pas d\'effort C2', () => {
-    const route = flatRoute()
-    const me = mkRider({ splinePos: 1000 }); me.id = 'me'
-    const ahead = mkRider({ splinePos: 1000 + 300 }); ahead.id = 'ahead' // 300 m
-    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'
-    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
-    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    expect(frac).toBeCloseTo(fracSolo, 5)
+  it('grimpeur plus rapide que la roue en montée → il déborde (roule à son rythme)', () => {
+    const route = climbRoute()
+    // Grimpeur léger : son instinct C1 en montée est nettement > la roue lente devant.
+    const me = mkRider({ splinePos: 1000, mass: 66 }); me.id = 'me'; me.speedKmh = 18
+    me.profile.ftpWatts = 270
+    const ahead = mkRider({ splinePos: 1006 }); ahead.id = 'ahead'; ahead.speedKmh = 14 // roue lente
+    decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    // Il ne se bride pas derrière la roue lente : état "déborde" ou "mon_rythme".
+    expect(me.aiLog[me.aiLog.length - 1].logKey).toMatch(/c2:(deborde|mon_rythme)/)
   })
 })
 
-// ─── C2 — convertir l'abri en épargne (se caler dans la roue) ───────────────
-describe('Couche 2 — se cale dans la roue pour épargner quand du parcours reste', () => {
-  it('juste derrière une roue, loin de l\'arrivée → effort INFÉRIEUR au solo', () => {
+// ─── C2 — réaction à l'accélération de la roue (réactivité, fatigue) ────────
+describe('Couche 2 — réaction à l\'accélération de la roue', () => {
+  it('la roue accélère (gap s\'ouvre) → réaction marquée pour la suivre', () => {
     const route = flatRoute()
-    const me = mkRider({ splinePos: 1000 }); me.id = 'me'
-    me.screenCount = 3            // abri effectif reçu → rouler moins cher à v égale
-    const ahead = mkRider({ splinePos: 1004 }); ahead.id = 'ahead' // 4 m → calé
-    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'
-    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
-    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    expect(frac).toBeLessThan(fracSolo)
+    const me = mkRider({ splinePos: 1000, endRatio: 1 }); me.id = 'me'; me.speedKmh = 38
+    me.screenCount = 2
+    // tick 1 : roue à 2 m, même vitesse (établit _prevGapAhead)
+    let ahead = mkRider({ splinePos: 1002 }); ahead.id = 'ahead'; ahead.speedKmh = 38
+    decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    // tick 2 : la roue a accéléré → gap s'ouvre à 5 m, elle roule plus vite
+    ahead = mkRider({ splinePos: 1005 }); ahead.id = 'ahead'; ahead.speedKmh = 42
+    const frac = decidePowerTarget(me, route, { simSec: 11, riders: [me, ahead] })
+    // Réaction : cible au-dessus de la simple croisière solo (~0.78).
+    expect(frac).toBeGreaterThan(0.80)
+    expect(me.aiLog[me.aiLog.length - 1].logKey).toBe('c2:roue')
   })
 
-  it('plat final proche de l\'arrivée → on n\'épargne plus (C1 lâche les watts)', () => {
-    // distanceToFinish < 6000 et plus d'ascension → finishingSoon : pas d'épargne.
-    const route = flatRoute(50000)
-    const me = mkRider({ splinePos: 45000 }); me.id = 'me'
-    const ahead = mkRider({ splinePos: 45004 }); ahead.id = 'ahead'
-    const solo = mkRider({ splinePos: 45000 }); solo.id = 'solo'
-    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
-    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    expect(frac).toBeCloseTo(fracSolo, 5)
-  })
-})
-
-// ─── C2 — jonction bon marché (recoller un petit trou, vite) ────────────────
-describe('Couche 2 — jonction bon marché : recoller un petit trou', () => {
-  it('petit trou (~13 m) à rythme modeste → grosse relance pour recoller', () => {
+  it('W\' bas → réaction plus molle (réactivité atténuée par la fatigue)', () => {
     const route = flatRoute()
-    // Le lissage (POWER_SMOOTH_UP) étale la hausse sur ~5 s : on simule quelques
-    // ticks de décision pour observer la cible de jonction se matérialiser.
-    const me = mkRider({ splinePos: 1000, endRatio: 1 }); me.id = 'me'; me.speedKmh = 35
-    const ahead = mkRider({ splinePos: 1013 }); ahead.id = 'ahead' // 13 m
-    const solo = mkRider({ splinePos: 1000, endRatio: 1 }); solo.id = 'solo'; solo.speedKmh = 35
-    let fSolo = 0, fMe = 0
-    for (let t = 0; t < 8; t++) {
-      fSolo = decidePowerTarget(solo, route, { simSec: 10 + t })
-      fMe = decidePowerTarget(me, route, { simSec: 10 + t, riders: [me, ahead] })
+    const mk = (wRatio) => {
+      const r = mkRider({ splinePos: 1000, endRatio: 1, wRatio }); r.id = 'r'; r.speedKmh = 38
+      r.screenCount = 2
+      return r
     }
-    // Après convergence, la jonction tire l'intensité nettement au-dessus du solo.
-    expect(fMe).toBeGreaterThan(fSolo + 0.10)
-  })
-
-  it('jonction appliquée même si l\'abri prospectif est faible (terrain montagneux devant)', () => {
-    // Horizon dominé par la montée → shelterVal sous le gate de valeur, mais la
-    // jonction bon marché s'applique quand même (gradient courant plat).
-    const route = {
-      getGradientAt: (p) => (p < 1100 ? 0 : 6),   // plat ici, montée juste après
-      totalLength: 50000,
-      segments: [
-        { from: 0, to: 1100, type: 'flat' },
-        { from: 1100, to: 50000, type: 'climb' },
-      ],
-    }
-    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 35
-    const ahead = mkRider({ splinePos: 1015 }); ahead.id = 'ahead'
-    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'; solo.speedKmh = 35
-    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
-    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    expect(frac).toBeGreaterThan(fracSolo)
-  })
-
-  it('jonction bornée par le budget : endurance basse → relance atténuée', () => {
-    const route = flatRoute()
-    const full = mkRider({ splinePos: 1000, endRatio: 1 }); full.id = 'full'; full.speedKmh = 35
-    const low  = mkRider({ splinePos: 1000, endRatio: 0.18 }); low.id = 'low'; low.speedKmh = 35
-    const aheadF = mkRider({ splinePos: 1013 }); aheadF.id = 'aF'
-    const aheadL = mkRider({ splinePos: 1013 }); aheadL.id = 'aL'
-    const overFull = decidePowerTarget(full, route, { simSec: 10, riders: [full, aheadF] })
-    const overLow  = decidePowerTarget(low,  route, { simSec: 10, riders: [low, aheadL] })
-    // À budget large, on pousse plus fort qu'à budget serré.
-    expect(overFull).toBeGreaterThan(overLow)
-  })
-
-  it('grand trou (au-delà du seuil jonction) → pas de jonction bon marché', () => {
-    // 80 m > C2_JOIN_GAP_M : seul le terme "valeur" peut jouer, pas la jonction.
-    const route = flatRoute()
-    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 35
-    const ahead = mkRider({ splinePos: 1080 }); ahead.id = 'ahead'
-    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    // Sur le plat, le terme valeur s'applique mais reste modéré (pas de +22%).
-    // On vérifie surtout qu'on ne déclenche pas la grosse relance de jonction.
-    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'; solo.speedKmh = 35
-    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
-    expect(frac - fracSolo).toBeLessThan(0.18)
+    const fresh = mk(1.0)
+    const tired = mk(0.10)
+    let aF = mkRider({ splinePos: 1002 }); aF.id = 'aF'; aF.speedKmh = 38
+    let aT = mkRider({ splinePos: 1002 }); aT.id = 'aT'; aT.speedKmh = 38
+    decidePowerTarget(fresh, route, { simSec: 10, riders: [fresh, aF] })
+    decidePowerTarget(tired, route, { simSec: 10, riders: [tired, aT] })
+    // même accélération de la roue pour les deux
+    aF = mkRider({ splinePos: 1006 }); aF.id = 'aF'; aF.speedKmh = 43
+    aT = mkRider({ splinePos: 1006 }); aT.id = 'aT'; aT.speedKmh = 43
+    const fFresh = decidePowerTarget(fresh, route, { simSec: 11, riders: [fresh, aF] })
+    const fTired = decidePowerTarget(tired, route, { simSec: 11, riders: [tired, aT] })
+    // Le frais réagit au moins aussi fort que le cramé (réactivité >= ).
+    expect(fFresh).toBeGreaterThanOrEqual(fTired - 1e-9)
   })
 })
 
@@ -224,31 +195,28 @@ describe('Couche 2 — composition avec C1', () => {
   })
 })
 
-// ─── C2 — calage sans dépassement + journal des décisions ───────────────────
-describe('Couche 2 — calage derrière la roue (pas de faux relais)', () => {
-  it('calé derrière → ne vise jamais au-dessus du solo (anti-dépassement)', () => {
+// ─── C2 — distance de suivi (anti faux-relais) + journal ────────────────────
+describe('Couche 2 — tenue de roue & journal', () => {
+  it('dans la roue à même vitesse → cible raisonnable, état c2:roue', () => {
     const route = flatRoute()
-    const me = mkRider({ splinePos: 1000 }); me.id = 'me'
+    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 40
     me.screenCount = 2
-    const ahead = mkRider({ splinePos: 1003 }); ahead.id = 'ahead' // collé
-    const solo = mkRider({ splinePos: 1000 }); solo.id = 'solo'
-    const fracSolo = decidePowerTarget(solo, route, { simSec: 10 })
-    const frac = decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    expect(frac).toBeLessThanOrEqual(fracSolo + 1e-9)
+    const ahead = mkRider({ splinePos: 1002 }); ahead.id = 'ahead'; ahead.speedKmh = 40
+    decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
+    expect(me.aiLog[me.aiLog.length - 1].logKey).toBe('c2:roue')
   })
 
-  it('journalise une transition d\'état C2 (chasse → calage)', () => {
+  it('journalise une transition d\'état (revenir → dans la roue)', () => {
     const route = flatRoute()
-    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 35
-    me.aiLog = []
-    let ahead = mkRider({ splinePos: 1030 }); ahead.id = 'ahead'   // 30 m → chasse
+    const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 38
+    me.screenCount = 2; me.aiLog = []
+    let ahead = mkRider({ splinePos: 1040 }); ahead.id = 'ahead'; ahead.speedKmh = 40 // loin
     decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    const keysChase = me.aiLog.map(e => e.logKey).join(' ')
-    me.screenCount = 3
-    ahead = mkRider({ splinePos: 1004 }); ahead.id = 'ahead'       // 4 m → calage
+    const keysFar = me.aiLog.map(e => e.logKey).join(' ')
+    ahead = mkRider({ splinePos: 1003 }); ahead.id = 'ahead'; ahead.speedKmh = 40     // dans la roue
     decidePowerTarget(me, route, { simSec: 12, riders: [me, ahead] })
-    const lastPhase = me.aiLog[me.aiLog.length - 1].logKey
-    expect(keysChase).toMatch(/c2:(chasse|jonction)/)
-    expect(lastPhase).toMatch(/c2:(cale|epargne)/)
+    const last = me.aiLog[me.aiLog.length - 1].logKey
+    expect(keysFar).toMatch(/c2:(reviens|mon_rythme)/)
+    expect(last).toBe('c2:roue')
   })
 })

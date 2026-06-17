@@ -67,7 +67,7 @@ const WPRIME_ANAEROBIC_RATES = { 4: 80, 5: 200, 6: 500 }
 // Courbe plafonnée : le bénéfice augmente avec le nombre d'écrans devant, avec
 // un rendement marginal décroissant, et plafonne à 7 écrans (au-delà, gain nul).
 // Index = nombre d'écrans dans le cône frontal ; valeur = réduction aéro de base.
-const DRAFT_BASE_TABLE = [0, 0.12, 0.22, 0.30, 0.36, 0.40, 0.43, 0.45]
+const DRAFT_BASE_TABLE = [0, 0.28, 0.38, 0.44, 0.48, 0.51, 0.53, 0.54]
 const DRAFT_CONE_DIST_M    = 10            // portée frontale du cône (m)
 const DRAFT_CONE_HALF_ANGLE = Math.PI / 6  // demi-angle 30°
 // Au-delà de cet écart longitudinal entre deux coureurs successifs (m), on
@@ -393,21 +393,27 @@ export function powerForSpeed(speedKmh, gradientPercent, draftFactor = 1, massKg
 }
 
 /**
- * Réduction aérodynamique due au draft.
- * Modèle frontal plafonné (TDD v0.5 §4bis.3) :
- *   draftEffectif = draftBase(screenCount) × clamp((v/40)², 0.05, 1.0)
- * Le facteur vitesse modélise l'effondrement de l'aspiration en montagne
- * (l'aéro est en v², donc à 15 km/h le draft est quasi nul).
+ * Réduction aérodynamique due au draft = fraction de CdA économisée selon le
+ * nombre d'écrans devant (rendement marginal décroissant, plafond ~0.54).
+ *
+ * Modèle (refonte) : PLUS de facteur vitesse. L'abri réduit le CdA, et la part
+ * de CdA économisée ne dépend pas de la vitesse — un coureur abrité économise
+ * grosso modo le même POURCENTAGE d'aéro à 22 ou 40 km/h. L'effondrement de
+ * l'aspiration en montagne ÉMERGE tout seul de la physique (computeSpeed /
+ * powerForSpeed) : à basse vitesse l'aéro est une petite part de la puissance
+ * totale (la pente domine), donc même un abri parfait ne gagne presque rien.
+ * L'ancien facteur (v/40)² faisait double emploi avec cet effet → abri amputé
+ * deux fois à vitesse moyenne (ex. 4% à 22 km/h). On le retire.
+ *
+ * `speedKmh` est conservé dans la signature (compat appelants) mais ignoré.
  *
  * @param {number} screenCount - nombre de coureurs faisant écran dans le cône
- * @param {number} speedKmh    - vitesse instantanée du coureur
- * @returns {number} réduction ∈ [0, 0.45] — fraction de CdA économisée
+ * @param {number} [speedKmh]  - ignoré (conservé pour compat de signature)
+ * @returns {number} réduction ∈ [0, 0.54] — fraction de CdA économisée
  */
 export function draftReduction(screenCount, speedKmh) {
-  const idx  = Math.min(Math.max(0, Math.floor(screenCount)), DRAFT_BASE_TABLE.length - 1)
-  const base = DRAFT_BASE_TABLE[idx]
-  const vFactor = Math.min(1.0, Math.max(0.05, (speedKmh / 40) ** 2))
-  return base * vFactor
+  const idx = Math.min(Math.max(0, Math.floor(screenCount)), DRAFT_BASE_TABLE.length - 1)
+  return DRAFT_BASE_TABLE[idx]
 }
 
 /**
@@ -893,7 +899,7 @@ export function decidePowerTarget(rider, route, context = {}) {
       // Économie d'abri SI je roule à la vitesse de la roue : puissance pour
       // tenir wheelV avec draft vs sans draft. Le draft (donc l'économie) dépend
       // de la vitesse → fond en montée. C'est tout le ressort du comportement.
-      const draftFrac   = draftReduction(rider.screenCount ?? 0, wheelV) // 0..0.45
+      const draftFrac   = draftReduction(rider.screenCount ?? 0, wheelV) // 0..0.54
       const pNoDraft    = powerForSpeed(wheelV, gradient, 1, myMass)
       const pDraft      = powerForSpeed(wheelV, gradient, 1 - draftFrac, myMass)
       const shelterGain = Math.max(0, (pNoDraft - pDraft) / Math.max(1, ftpW)) // en frac de FTP

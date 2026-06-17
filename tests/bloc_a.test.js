@@ -8,29 +8,35 @@ import {
   createRider,
 } from '../src/simulation/engine.js'
 
-// ─── draftReduction — courbe plafonnée v0.5 ─────────────────────────────────
-describe('draftReduction — courbe plafonnée (TDD v0.5 §4bis.3)', () => {
-  it('0 écran à pleine vitesse → pas d\'abri', () => {
+// ─── draftReduction — courbe (refonte : sans facteur vitesse) ───────────────
+describe('draftReduction — réduction de CdA (refonte, indépendante de la vitesse)', () => {
+  it('0 écran → pas d\'abri', () => {
     expect(draftReduction(0, 40)).toBe(0)
+    expect(draftReduction(0, 15)).toBe(0)
   })
 
-  it('valeurs de base à 40 km/h (facteur vitesse = 1)', () => {
-    expect(draftReduction(1, 40)).toBeCloseTo(0.12, 5)
-    expect(draftReduction(2, 40)).toBeCloseTo(0.22, 5)
-    expect(draftReduction(3, 40)).toBeCloseTo(0.30, 5)
-    expect(draftReduction(5, 40)).toBeCloseTo(0.40, 5)
-    expect(draftReduction(7, 40)).toBeCloseTo(0.45, 5)
+  it('valeurs de base (table revue)', () => {
+    expect(draftReduction(1)).toBeCloseTo(0.28, 5)
+    expect(draftReduction(2)).toBeCloseTo(0.38, 5)
+    expect(draftReduction(3)).toBeCloseTo(0.44, 5)
+    expect(draftReduction(5)).toBeCloseTo(0.51, 5)
+    expect(draftReduction(7)).toBeCloseTo(0.54, 5)
+  })
+
+  it('indépendant de la vitesse : même valeur à 40, 22 ou 15 km/h', () => {
+    expect(draftReduction(2, 40)).toBeCloseTo(draftReduction(2, 22), 9)
+    expect(draftReduction(2, 22)).toBeCloseTo(draftReduction(2, 15), 9)
   })
 
   it('plafonne à 7 écrans : 7, 8, 50 identiques', () => {
-    const at7 = draftReduction(7, 40)
-    expect(draftReduction(8, 40)).toBe(at7)
-    expect(draftReduction(20, 40)).toBe(at7)
-    expect(draftReduction(50, 40)).toBe(at7)
+    const at7 = draftReduction(7)
+    expect(draftReduction(8)).toBe(at7)
+    expect(draftReduction(20)).toBe(at7)
+    expect(draftReduction(50)).toBe(at7)
   })
 
   it('rendement marginal décroissant (la courbe est concave)', () => {
-    const d = [0,1,2,3,4,5,6,7].map(n => draftReduction(n, 40))
+    const d = [0,1,2,3,4,5,6,7].map(n => draftReduction(n))
     const gains = []
     for (let i = 1; i < d.length; i++) gains.push(d[i] - d[i-1])
     for (let i = 1; i < gains.length; i++) {
@@ -38,23 +44,19 @@ describe('draftReduction — courbe plafonnée (TDD v0.5 §4bis.3)', () => {
     }
   })
 
-  it('effet montagne : l\'abri s\'effondre à basse vitesse', () => {
-    const flat = draftReduction(7, 40)   // plein effet
-    const climb = draftReduction(7, 15)  // col
-    expect(climb).toBeLessThan(flat * 0.25)
-  })
-
-  it('facteur vitesse plancher à 0.05 (jamais nul tant qu\'il y a un écran)', () => {
-    const veryLow = draftReduction(7, 5)
-    expect(veryLow).toBeCloseTo(0.45 * 0.05, 5)
-  })
-
-  it('borne supérieure : ne dépasse jamais 0.45', () => {
+  it('borne supérieure : ne dépasse jamais 0.54', () => {
     for (let n = 0; n < 30; n++) {
-      for (const v of [5, 15, 30, 40, 60]) {
-        expect(draftReduction(n, v)).toBeLessThanOrEqual(0.45 + 1e-9)
-      }
+      expect(draftReduction(n)).toBeLessThanOrEqual(0.54 + 1e-9)
     }
+  })
+
+  it('effet montagne ÉMERGENT : à puissance égale, le gain de vitesse s\'effondre en côte', () => {
+    // L'effondrement n'est plus dans draftReduction (constant) mais émerge de
+    // la physique : en montée l'aéro est minoritaire, donc l'abri gagne peu.
+    const df = 1 - draftReduction(7)
+    const flatGain  = computeSpeed(250, 0, 0, df) - computeSpeed(250, 0, 0, 1)
+    const climbGain = computeSpeed(250, 9, 0, df) - computeSpeed(250, 9, 0, 1)
+    expect(climbGain).toBeLessThan(flatGain * 0.25)
   })
 })
 

@@ -57,6 +57,40 @@ const WPRIME_RECOVERY_REF_W = 100
 // avant modulation enduranceFactor × freshness.
 const WPRIME_RECOVERY_RATE = 50
 
+// ─── EN1 — couplage endurance → W' (PBI v1.4 §2) ────────────────────────────
+// DÉCISION ACTÉE : W' est l'unique variable de décision tactique. L'endurance
+// n'est PAS une variable de décision : c'est un état de fond, lent, qui
+// GOUVERNE le W' par deux effets distincts, et un seuil terminal.
+//
+// (a) Recharge ralentie : plus l'endurance baisse, plus la recharge de W' est
+//     lente. endGate = lerp(FLOOR, 1, enduranceRatio) multiplie la recharge.
+//     À endurance pleine → ×1 ; au plancher → ×WPRIME_RECOVERY_END_FLOOR.
+const WPRIME_RECOVERY_END_FLOOR = 0.40
+// (b) Plafond rétréci : wPrime.max devient MOBILE, fonction de l'endurance.
+//     max courant = wPrimeJ × lerp(RESIDUAL, 1, enduranceRatio). À l'épuisement,
+//     le plafond tend vers un petit résidu non nul (EN3) — un dernier coup
+//     minime reste possible, plus rien de décisif.
+const WPRIME_MAX_RESIDUAL = 0.15
+// Seuil terminal : sous ce ratio d'endurance, explosion (terminal, ~Z2,
+// irréversible). Remplace le déclencheur « endurance.current <= 0 ». Le seuil
+// bas (vs 0 pile) laisse une marge avant le mur et évite l'à-coup du zéro.
+const ENDURANCE_EXPLODE_FLOOR = 0.05
+
+/**
+ * EN1 (b) — plafond W' mobile gouverné par l'endurance courante.
+ * Fonction pure : à endurance pleine → wPrimeJ nominal ; au plancher → résidu.
+ * @param {object} energy - rider.energy ({ wPrime:{max}, endurance:{current,max} })
+ * @param {number} wPrimeNominal - réservoir W' nominal du coureur (profile.wPrimeJ)
+ * @returns {number} plafond W' courant (J)
+ */
+export function wPrimeMaxFor(energy, wPrimeNominal) {
+  const endMax = energy.endurance?.max ?? 1
+  const endRatio = endMax > 0
+    ? Math.max(0, Math.min(1, energy.endurance.current / endMax))
+    : 0
+  return wPrimeNominal * (WPRIME_MAX_RESIDUAL + (1 - WPRIME_MAX_RESIDUAL) * endRatio)
+}
+
 // ─── LEGACY (projection C1 historique / compat tests) ───────────────────────
 // Conservés pour référence ; le tick réel n'indexe plus le coût sur la zone.
 const ENDURANCE_AEROBIC_RATES = [0, 0.2, 0.5, 1.0]
@@ -201,6 +235,7 @@ export function createRider(overrides = {}) {
       endurance:  { current: 9000, max: 9000 },
       // wPrime = réserve anaérobie (W'). current = wBalance (jauge courante).
       wPrime:     { current: 25000, max: 25000 },
+      wPrimeNominal: 25000,   // EN1 : réservoir W' nominal (max mobile = f(endurance))
       zone:       2,
       ftpWatts:   280,
       exploded:   false,      // explosion Endurance — irréversible sur la course
@@ -244,6 +279,7 @@ export function createAIRider(overrides = {}) {
     energy: {
       endurance:  { current: 9000, max: 9000 },
       wPrime:     { current: prof.wPrimeJ, max: prof.wPrimeJ },
+      wPrimeNominal: prof.wPrimeJ,
       zone:       2,
       ftpWatts:   prof.ftpWatts,
       exploded:   false,
@@ -312,6 +348,7 @@ export function createRidersFromRoster(roster, opts = {}) {
       energy: {
         endurance:  { current: enduranceMaxFor(prof.enduranceFactor), max: enduranceMaxFor(prof.enduranceFactor) },
         wPrime:     { current: prof.wPrimeJ, max: prof.wPrimeJ },
+        wPrimeNominal: prof.wPrimeJ,
         zone:       2,
         ftpWatts:   prof.ftpWatts,
         exploded:   false,
@@ -1080,10 +1117,22 @@ export function applyEnergy(rider, powerWatts, dtSec = 1) {
   const zone = getZoneFromFtpRatio(ftpRatio)
   energy.zone = zone
 
+  // ── EN1 (b) — plafond W' mobile gouverné par l'endurance ────────────────
+  // Recalculé en tête de tick : la recharge et le clamp du current ci-dessous
+  // utilisent le max du tick. Plus l'endurance baisse, plus le réservoir W'
+  // rétrécit (jusqu'à un résidu non nul à l'épuisement, EN3). Si le plafond
+  // passe SOUS le current (réservoir qui se contracte), on clampe le current.
+  const wNominal = energy.wPrimeNominal ?? energy.wPrime.max
+  energy.wPrime.max = wPrimeMaxFor(energy, wNominal)
+  if (energy.wPrime.current > energy.wPrime.max) {
+    energy.wPrime.current = energy.wPrime.max
+  }
+
   // ── W' : modèle continu (inspiré de Skiba) ──────────────────────────────
   // Au-dessus du FTP, W' se vide proportionnellement aux watts EXCÉDENTAIRES
   // (powerWatts − ftp). Sous le FTP, il se recharge proportionnellement au
-  // déficit (ftp − powerWatts), modulé par enduranceFactor × freshness.
+  // déficit (ftp − powerWatts), modulé par enduranceFactor × freshness ET par
+  // l'endurance courante (EN1 a : recharge ralentie quand l'endurance baisse).
   // Conséquence directe : un coureur qui pousse 320 W pour 250 W de FTP dans
   // une bosse paye, même si le label affiche « Z3 » — le coût suit l'effort,
   // plus l'étiquette.
@@ -1099,7 +1148,15 @@ export function applyEnergy(rider, powerWatts, dtSec = 1) {
     const deficit = Math.min(ftp - powerWatts, WPRIME_RECOVERY_REF_W)
     const endF = rider.profile?.enduranceFactor ?? 1
     const fresh = energy.freshness ?? 1
-    const recovery = (deficit / WPRIME_RECOVERY_REF_W) * WPRIME_RECOVERY_RATE * endF * fresh
+    // EN1 (a) : porte d'endurance. À endurance pleine → ×1 ; au plancher →
+    // ×WPRIME_RECOVERY_END_FLOOR. Les cartouches reviennent de plus en plus
+    // mal au fil de la course.
+    const endMax = energy.endurance?.max ?? 1
+    const endRatio = endMax > 0
+      ? Math.max(0, Math.min(1, energy.endurance.current / endMax))
+      : 0
+    const endGate = WPRIME_RECOVERY_END_FLOOR + (1 - WPRIME_RECOVERY_END_FLOOR) * endRatio
+    const recovery = (deficit / WPRIME_RECOVERY_REF_W) * WPRIME_RECOVERY_RATE * endF * fresh * endGate
     energy.wPrime.current = Math.min(energy.wPrime.max, energy.wPrime.current + recovery * dtSec)
   }
 
@@ -1107,13 +1164,19 @@ export function applyEnergy(rider, powerWatts, dtSec = 1) {
   // Drain = taux de base × (puissance / FTP)². Le carré accentue le coût des
   // hautes intensités soutenues : 10 km de HC à 1.0×FTP coûtent bien plus que
   // du plat à 0.65×FTP, sans paliers de zone. Un effort sous ~0.5×FTP draine
-  // un minimum (le coureur consomme toujours un peu).
+  // un minimum (le coureur consomme toujours un peu). EN1 : ce drain n'est plus
+  // un déclencheur d'explosion — il GOUVERNE le W' (plafond + recharge) et,
+  // au plancher, devient terminal. Plus aucune exception « sauf en montée ».
   const intensity = Math.max(0.5, ftpRatio)
   const enduranceDrain = ENDURANCE_BASE_RATE * intensity * intensity
   energy.endurance.current = Math.max(0, energy.endurance.current - enduranceDrain * dtSec)
 
-  // Explosion Endurance
-  if (energy.endurance.current <= 0) {
+  // ── EN1 — explosion = atteinte du PLANCHER d'endurance (terminal) ───────
+  // Échec endurance = global, TERMINAL (bridage dur ~Z2, irréversible). À
+  // distinguer de l'échec W' (local, réversible, géré par wFailTicks). Seuil
+  // bas (vs 0 pile) : marge avant le mur, pas d'à-coup du zéro.
+  const endMaxNow = energy.endurance?.max ?? 1
+  if (endMaxNow > 0 && energy.endurance.current / endMaxNow <= ENDURANCE_EXPLODE_FLOOR) {
     energy.exploded = true
   }
 

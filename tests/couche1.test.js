@@ -248,7 +248,7 @@ describe('decideTargetZone — journal de raisonnement (rider.aiLog, B1)', () =>
     expect(r.aiLog).toHaveLength(1)
   })
 
-  it('nouvelle entrée quand la phase de course change', () => {
+  it('nouvelle entrée quand la décision change', () => {
     const r = mkRider('grimpeur', { wRatio: 1.0, splinePos: 0 })
     r.speedKmh = 30
     decidePowerTarget(r, mkRoute({ gradient: 0 }), { simSec: 0 })   // plat
@@ -420,11 +420,11 @@ describe('Hystérésis de récupération W\' (anti-girouette)', () => {
   })
 })
 
-// ─── Journal B1 : dédup sur la phase, pas sur le texte (fix log périodique) ───
-describe('Journal de raisonnement — déduplication par phase', () => {
+// ─── Journal B1 : dédup sur la clé de décision, pas sur le texte (fix log périodique) ───
+describe('Journal de raisonnement — déduplication par clé de décision', () => {
   const flat = { getGradientAt: () => 0, totalLength: 50000, segments: [] }
 
-  it('n\'ajoute pas d\'entrée quand seule la distance change (même phase)', () => {
+  it('n\'ajoute pas d\'entrée quand seule la distance change (même décision)', () => {
     const r = createAIRider({ aiProfile: 'grimpeur', splinePos: 0 })
     r.speedKmh = 35
     // 200 ticks de plat : la distance à l'arrivée défile, mais la décision (plat,
@@ -436,7 +436,7 @@ describe('Journal de raisonnement — déduplication par phase', () => {
     expect(r.aiLog.length).toBeLessThanOrEqual(2)
   })
 
-  it('ajoute une entrée à un vrai changement de phase (plat → montée)', () => {
+  it('ajoute une entrée à un vrai changement de décision (plat → montée)', () => {
     const r = createAIRider({ aiProfile: 'grimpeur', splinePos: 0 })
     r.speedKmh = 30
     decidePowerTarget(r, flat, { simSec: 0 })

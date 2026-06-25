@@ -67,7 +67,7 @@ const WPRIME_ANAEROBIC_RATES = { 4: 80, 5: 200, 6: 500 }
 // Courbe plafonnée : le bénéfice augmente avec le nombre d'écrans devant, avec
 // un rendement marginal décroissant, et plafonne à 7 écrans (au-delà, gain nul).
 // Index = nombre d'écrans dans le cône frontal ; valeur = réduction aéro de base.
-const DRAFT_BASE_TABLE = [0, 0.12, 0.22, 0.30, 0.36, 0.40, 0.43, 0.45]
+const DRAFT_BASE_TABLE = [0, 0.28, 0.38, 0.44, 0.48, 0.51, 0.53, 0.54]
 const DRAFT_CONE_DIST_M    = 10            // portée frontale du cône (m)
 const DRAFT_CONE_HALF_ANGLE = Math.PI / 6  // demi-angle 30°
 // Au-delà de cet écart longitudinal entre deux coureurs successifs (m), on
@@ -367,22 +367,53 @@ export function computeSpeed(powerWatts, gradientPercent, windKmh = 0, draftFact
 }
 
 // ─── Aspiration / draft ──────────────────────────────────────────────────────
+
 /**
- * Réduction aérodynamique due au draft.
- * Modèle frontal plafonné (TDD v0.5 §4bis.3) :
- *   draftEffectif = draftBase(screenCount) × clamp((v/40)², 0.05, 1.0)
- * Le facteur vitesse modélise l'effondrement de l'aspiration en montagne
- * (l'aéro est en v², donc à 15 km/h le draft est quasi nul).
+ * Puissance (W) nécessaire pour tenir une vitesse cible, à pente/draft donnés.
+ * Inverse de computeSpeed : la puissance est explicite en fonction de v, donc
+ * pas de dichotomie. Sert à la couche 2 — convertir « la vitesse de la roue
+ * devant » en une cible d'intensité (fraction de FTP) comparable à l'instinct C1.
+ *
+ * @param {number} speedKmh       - vitesse cible (km/h)
+ * @param {number} gradientPercent
+ * @param {number} draftFactor    - 1 = pas d'abri ; <1 = CdA réduit par le draft
+ * @param {number} massKg
+ * @returns {number} puissance en watts
+ */
+export function powerForSpeed(speedKmh, gradientPercent, draftFactor = 1, massKg = PHYSICS.mass) {
+  const { rho, g, Crr } = PHYSICS
+  const mass = massKg ?? PHYSICS.mass
+  const CdA = (Math.abs(gradientPercent) > 3 ? PHYSICS.CdA_climb : PHYSICS.CdA_flat) * draftFactor
+  const gradient = gradientPercent / 100
+  const v = Math.max(0.1, speedKmh / 3.6)
+  const pAero = 0.5 * CdA * rho * v * v * v
+  const pPente = mass * g * Math.sin(Math.atan(gradient)) * v
+  const pRoul = Crr * mass * g * v
+  return Math.max(0, pAero + pPente + pRoul)
+}
+
+/**
+ * Réduction aérodynamique due au draft = fraction de CdA économisée selon le
+ * nombre d'écrans devant (rendement marginal décroissant, plafond ~0.54).
+ *
+ * Modèle (refonte) : PLUS de facteur vitesse. L'abri réduit le CdA, et la part
+ * de CdA économisée ne dépend pas de la vitesse — un coureur abrité économise
+ * grosso modo le même POURCENTAGE d'aéro à 22 ou 40 km/h. L'effondrement de
+ * l'aspiration en montagne ÉMERGE tout seul de la physique (computeSpeed /
+ * powerForSpeed) : à basse vitesse l'aéro est une petite part de la puissance
+ * totale (la pente domine), donc même un abri parfait ne gagne presque rien.
+ * L'ancien facteur (v/40)² faisait double emploi avec cet effet → abri amputé
+ * deux fois à vitesse moyenne (ex. 4% à 22 km/h). On le retire.
+ *
+ * `speedKmh` est conservé dans la signature (compat appelants) mais ignoré.
  *
  * @param {number} screenCount - nombre de coureurs faisant écran dans le cône
- * @param {number} speedKmh    - vitesse instantanée du coureur
- * @returns {number} réduction ∈ [0, 0.45] — fraction de CdA économisée
+ * @param {number} [speedKmh]  - ignoré (conservé pour compat de signature)
+ * @returns {number} réduction ∈ [0, 0.54] — fraction de CdA économisée
  */
 export function draftReduction(screenCount, speedKmh) {
-  const idx  = Math.min(Math.max(0, Math.floor(screenCount)), DRAFT_BASE_TABLE.length - 1)
-  const base = DRAFT_BASE_TABLE[idx]
-  const vFactor = Math.min(1.0, Math.max(0.05, (speedKmh / 40) ** 2))
-  return base * vFactor
+  const idx = Math.min(Math.max(0, Math.floor(screenCount)), DRAFT_BASE_TABLE.length - 1)
+  return DRAFT_BASE_TABLE[idx]
 }
 
 /**
@@ -572,6 +603,33 @@ export function gapToGroupAhead(rider, groups) {
 }
 
 /**
+ * Coureur le plus proche DEVANT `rider` sur la spline (couche 2).
+ *
+ * Primitive purement LONGITUDINALE : on ignore l'offset latéral et la notion
+ * de groupe. Le coureur cherche « la roue devant », proche ou éloignée, tant
+ * qu'elle existe — c'est l'objectif vers lequel il peut décider de fournir un
+ * effort (revenir / rester accroché), justifié par l'abri qu'il en tirera une
+ * fois la jonction faite. Le caractère « atteignable » n'est pas tranché ici :
+ * c'est l'arbitrage de coût (decidePowerTarget) qui décide si ça vaut la peine.
+ *
+ * @param {Object} rider  - expose `splinePos`, `id`
+ * @param {Array}  riders - tous les coureurs
+ * @returns {{ rider: Object, gap: number } | null} la roue devant + écart (m),
+ *          ou null si `rider` est en tête de course.
+ */
+export function nearestRiderAhead(rider, riders) {
+  let best = null
+  let bestGap = Infinity
+  for (const r of riders) {
+    if (r.id === rider.id) continue
+    const gap = r.splinePos - rider.splinePos
+    if (gap <= 0) continue            // pas devant
+    if (gap < bestGap) { bestGap = gap; best = r }
+  }
+  return best ? { rider: best, gap: bestGap } : null
+}
+
+/**
  * Prochain « moment décisif » pour `rider`, selon son profil IA (PBI v1.1, §2) :
  *  - grimpeur            → sommet de la prochaine montée
  *  - rouleur / équipier  → début de la prochaine portion de plat
@@ -643,6 +701,27 @@ const WBAL_RAISE_ABOVE = 0.40  // au-dessus → autorisé à viser plus haut à 
 // Engagement minimum : une zone choisie est tenue ce nombre de ticks (s) avant
 // qu'une nouvelle MONTÉE de zone soit permise (une baisse d'urgence passe outre).
 const ZONE_COMMIT_TICKS = 5
+
+// ─── Couche 2 — le coureur dans le flux (abri ambiant) ──────────────────────
+// Arbitrage UNIQUE par les vitesses (pas de cas spécial montée, pas de régimes
+// par distance). À chaque tick le coureur compare DEUX vitesses de référence :
+//   • sa vitesse "instinct" C1 (ce qu'il ferait seul, dérivée de fracSolo) ;
+//   • la vitesse de la roue/groupe devant.
+// Il calcule le BÉNÉFICE NET de prendre la vitesse du groupe = économie d'abri
+// (qui dépend de la vitesse → fond en montée via le facteur v²) MOINS l'inconfort
+// d'être hors de son rythme. Si positif → il adopte la vitesse du groupe (et
+// réagit vite à ses accélérations, d'autant plus vite qu'il est frais). Sinon →
+// il roule à son instinct C1, et DÉBORDE mécaniquement s'il va réellement plus
+// vite. Le comportement terrain (grimpeur qui lâche la roue en côte, calage sur
+// le plat) ÉMERGE de cet arbitrage — aucune règle si-pente.
+const C2_FOLLOW_DIST_M    = 2.0   // distance de suivi cible derrière la roue (~1 longueur + jeu)
+const C2_IN_WHEEL_GAP_M   = 12    // au-delà, je ne suis plus "dans la roue" : je dois revenir
+const C2_CHASE_MAX_GAP_M  = 150   // au-delà, une roue isolée n'est plus une cible
+const C2_REACT_UP         = 0.40  // réactivité à une accélération de la roue (frais)
+const C2_REACT_W_FATIGUE  = 0.55  // facteur de réactivité quand le W' est bas (< plus mou)
+const C2_COMFORT_K        = 0.9   // pondère l'inconfort d'être hors de son rythme C1
+const C2_JOIN_CLOSE_SEC   = 4     // horizon de fermeture d'un trou (revenir)
+const C2_MAX_OVERSPEED    = 0.30  // surcoût max (frac) concédé pour revenir/tenir
 
 // Plafond de zone selon la masse en montée : plus lourd = plafond plus bas.
 // (IA Couches v0.1 §9.1 — « on plafonne selon mass »).
@@ -727,7 +806,8 @@ export function decidePowerTarget(rider, route, context = {}) {
 
   let target           // fraction de FTP visée
   let reason           // texte d'affichage (peut contenir des valeurs mouvantes)
-  let phase            // signature stable de la décision (dédup du journal)
+  let logKey           // clé de déduplication du journal (PAS une machine d'états :
+                       // les décisions viennent de C1/C2, ceci ne fait qu'étiqueter)
 
   if (gradient >= 2) {
     // ── MONTÉE : gestion de budget continue ───────────────────────────────
@@ -763,7 +843,7 @@ export function decidePowerTarget(rider, route, context = {}) {
     target = frac
     const wkg = (ftp / mass).toFixed(1)
     const finishing = remainM < 1200 && after === 0
-    phase = `montee:z${getZoneFromFtpRatio(frac)}${finishing ? ':relance' : ''}`
+    logKey = `montee:z${getZoneFromFtpRatio(frac)}${finishing ? ':relance' : ''}`
     reason = `Montée ${gradient.toFixed(1)}% sur ${(remainM/1000).toFixed(1)}km → ` +
              `${Math.round(frac*100)}% FTP (W' réparti jusqu'au sommet, ${wkg} W/kg` +
              `${after ? `, ${after} ascension(s) après` : ''}${finishing ? ', relance finale' : ''}).`
@@ -774,7 +854,7 @@ export function decidePowerTarget(rider, route, context = {}) {
     //    descente que les gabarits lourds reprennent naturellement (gravité), on
     //    limite la casse sans gaspiller.
     target = 0.72
-    phase = 'descente'
+    logKey = 'descente'
     reason = `Descente ${gradient.toFixed(1)}% → on garde du rythme (${Math.round(target*100)}% FTP).`
   } else {
     // ── PLAT / FAUX-PLAT : intensité d'endurance ───────────────────────────
@@ -786,14 +866,108 @@ export function decidePowerTarget(rider, route, context = {}) {
       const endFrac = energy.endurance.current / energy.endurance.max
       target = 0.80 + 0.25 * Math.max(0, endFrac)    // jusqu'à ~1.05 si réservoir plein
       target = Math.min(target, 1.05)
-      phase = `platfinal:z${getZoneFromFtpRatio(target)}`
+      logKey = `platfinal:z${getZoneFromFtpRatio(target)}`
       reason = `Plat final, plus de difficulté → on lâche les watts ` +
                `(${Math.round(target*100)}% FTP, endurance ${Math.round(endFrac*100)}%).`
     } else {
       target = distanceToFinish <= 2000 ? 0.88 : 0.78
-      phase = `plat:z${getZoneFromFtpRatio(target)}`
+      logKey = `plat:z${getZoneFromFtpRatio(target)}`
       reason = `Plat/faux-plat → croisière ${Math.round(target*100)}% FTP ` +
                `(arrivée à ${(distanceToFinish/1000).toFixed(1)} km).`
+    }
+  }
+
+  // ── Couche 2 — arbitrage unique par les vitesses (abri ambiant) ─────────
+  // C1 a posé l'instinct solo (fracSolo). C2 compare la vitesse de la roue
+  // devant à ma vitesse-instinct et décide : suivre (adopter sa vitesse, abri)
+  // ou rouler à mon rythme (et déborder si je vais vraiment plus vite). Pas de
+  // cas pente : l'abri fond en montée via le facteur v², donc le grimpeur lâche
+  // la roue tout seul. La sécurité (W'/explosion) garde le dernier mot (bloc
+  // suivant) ; on ne touche pas un coureur explosé.
+  const fracSolo = target
+  const riders = context.riders
+  if (riders && riders.length > 1 && !energy.exploded) {
+    const ahead = nearestRiderAhead(rider, riders)
+    if (ahead && ahead.gap <= C2_CHASE_MAX_GAP_M) {
+      const myMass   = rider.profile?.mass
+      const myV      = Math.max(1, rider.speedKmh ?? 1)
+      const wheelV   = Math.max(1, ahead.rider.speedKmh ?? myV)
+      // Vitesse "instinct" C1 : celle que je tiendrais SEUL à fracSolo (sans abri).
+      const ftpW     = energy.ftpWatts * (energy.dayFormMod ?? 1)
+      const soloV    = computeSpeed(fracSolo * ftpW, gradient, 0, 1, myMass)
+
+      // Économie d'abri SI je roule à la vitesse de la roue : puissance pour
+      // tenir wheelV avec draft vs sans draft. Le draft (donc l'économie) dépend
+      // de la vitesse → fond en montée. C'est tout le ressort du comportement.
+      const draftFrac   = draftReduction(rider.screenCount ?? 0, wheelV) // 0..0.54
+      const pNoDraft    = powerForSpeed(wheelV, gradient, 1, myMass)
+      const pDraft      = powerForSpeed(wheelV, gradient, 1 - draftFrac, myMass)
+      const shelterGain = Math.max(0, (pNoDraft - pDraft) / Math.max(1, ftpW)) // en frac de FTP
+
+      // Inconfort d'être hors de mon rythme : |vitesse de la roue − mon instinct|,
+      // rapporté à mon instinct, pondéré. Suivre une roue trop lente OU trop
+      // rapide coûte ; l'abri doit compenser.
+      const mismatch  = Math.abs(wheelV - soloV) / Math.max(1, soloV)
+      const discomfort = C2_COMFORT_K * mismatch
+
+      const followIsWorth = shelterGain >= discomfort
+
+      // Réactivité : un coureur frais matche vite une accélération ; W' bas = plus mou.
+      const wRatio = energy.wPrime.current / Math.max(1, energy.wPrime.max)
+      const react  = C2_REACT_UP * (wRatio < 0.3 ? C2_REACT_W_FATIGUE : 1)
+
+      if (ahead.gap > C2_IN_WHEEL_GAP_M) {
+        // ── PAS ENCORE DANS LA ROUE ──────────────────────────────────────────
+        // Si la suivre vaut le coup, je reviens : je vise la vitesse de la roue
+        // + le surplus nécessaire pour refermer le trou en ~JOIN_CLOSE_SEC.
+        if (followIsWorth) {
+          const closeVMs = (ahead.gap - C2_FOLLOW_DIST_M) / C2_JOIN_CLOSE_SEC // m/s à rattraper
+          const targetVKmh = wheelV + Math.max(0, closeVMs * 3.6)
+          const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
+          const overFrac = Math.min(C2_MAX_OVERSPEED, Math.max(0, pNeed / ftpW - fracSolo))
+          target = fracSolo + overFrac
+          logKey = 'c2:reviens'
+          reason = `Roue devant à ${Math.round(ahead.gap)} m, ça vaut l'abri → ` +
+                   `+${Math.round(overFrac*100)}% pour revenir (gain abri ${(shelterGain*100).toFixed(0)}%).`
+        } else {
+          // Pas rentable de revenir : je roule à mon instinct.
+          logKey = 'c2:mon_rythme'
+          reason = `Roue devant à ${Math.round(ahead.gap)} m mais peu d'abri ici ` +
+                   `(${(shelterGain*100).toFixed(0)}%) → je roule à mon rythme (${Math.round(fracSolo*100)}% FTP).`
+        }
+      } else {
+        // ── DANS LA ROUE ─────────────────────────────────────────────────────
+        if (followIsWorth) {
+          // Je tiens la roue : cible = SA vitesse (l'abri rend ça moins cher que
+          // mon instinct), + réaction immédiate si elle accélère (le trou s'ouvre,
+          // dGap>0) atténuée par la fatigue, + petite correction de distance de
+          // suivi. On ne vise jamais "passer" : on vise tenir FOLLOW_DIST derrière.
+          const prevGap = rider._prevGapAhead
+          const dGap = Number.isFinite(prevGap) ? (ahead.gap - prevGap) : 0
+          const distErr = ahead.gap - C2_FOLLOW_DIST_M            // >0 = trop loin, je relance un peu
+          const reactKmh = Math.max(0, dGap) * react * 3.6        // réaction à l'accélération
+          const corrKmh  = Math.max(-2, Math.min(4, distErr)) * 0.4
+          const targetVKmh = wheelV + reactKmh + corrKmh
+          const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
+          target = Math.max(0.50, Math.min(1.50, pNeed / ftpW))
+          logKey = 'c2:roue'
+          reason = `Dans la roue (${ahead.gap.toFixed(1)} m) → je tiens sa vitesse ` +
+                   `${wheelV.toFixed(0)} km/h à ${Math.round(target*100)}% FTP` +
+                   `${dGap > 0.3 ? ' (elle accélère, je réagis)' : ''}.`
+          rider._prevGapAhead = ahead.gap
+        } else {
+          // La roue ne vaut plus l'abri (trop lente/rapide pour moi ici, ex.
+          // grimpeur en côte) → je roule à mon rythme. Si soloV > wheelV, je
+          // déborde mécaniquement (légitime, vraie différence de rythme).
+          logKey = soloV > wheelV + 0.5 ? 'c2:deborde' : 'c2:mon_rythme'
+          const verb = soloV > wheelV + 0.5 ? 'je déborde et passe' : 'je roule à mon rythme'
+          reason = `Roue devant peu rentable ici (abri ${(shelterGain*100).toFixed(0)}%, ` +
+                   `inconfort ${(discomfort*100).toFixed(0)}%) → ${verb} (${Math.round(fracSolo*100)}% FTP).`
+          rider._prevGapAhead = ahead.gap
+        }
+      }
+    } else {
+      rider._prevGapAhead = ahead ? ahead.gap : undefined
     }
   }
 
@@ -807,14 +981,14 @@ export function decidePowerTarget(rider, route, context = {}) {
   if (energy.exploded) {
     target = 0.50
     rider._recoveringW = false
-    phase = 'explose'
+    logKey = 'explose'
     reason = `Explosion Endurance → ${Math.round(target*100)}% FTP forcé (irréversible).`
   } else {
     if (wBal < WBAL_DROP_BELOW) rider._recoveringW = true
     else if (wBal >= WBAL_RECOVER_EXIT) rider._recoveringW = false
     if (rider._recoveringW) {
       target = Math.min(target, 0.80)
-      phase = 'recup_w'
+      logKey = 'recup_w'
       reason = `Réserve W' basse (${_pct(wBal)}%) → ${Math.round(target*100)}% FTP, je récupère jusqu'à ${Math.round(WBAL_RECOVER_EXIT*100)}%.`
     }
   }
@@ -835,7 +1009,7 @@ export function decidePowerTarget(rider, route, context = {}) {
   rider.powerFrac = next
   rider.targetZone = getZoneFromFtpRatio(next)     // dérivé pour l'affichage
   rider.aiState = next >= 1.05 ? 'effort_fort' : next >= 0.80 ? 'soutenu' : 'economie'
-  _logPowerDecision(rider, simSec, reason, phase)
+  _logPowerDecision(rider, simSec, reason, logKey)
   return next
 }
 
@@ -855,17 +1029,18 @@ function _massPowerCeil(mass) {
 const POWER_SMOOTH_UP = 0.15
 const POWER_SMOOTH_DOWN = 0.35
 
-// Journal B1 : une entrée par CHANGEMENT DE PHASE de course (j'attaque la
-// montée, je bascule en récup, je relâche sur le plat final), pas à chaque tick.
-// La déduplication se fait sur `phase` (signature stable : terrain + zone visée)
-// et NON sur `reason`, qui contient des valeurs mouvantes (distance à l'arrivée,
-// % d'endurance) — sinon une simple progression de 0.1 km créait une fausse
-// entrée toutes les ~10 s, sans changement réel de décision.
-function _logPowerDecision(rider, simSec, reason, phase) {
+// Journal B1 : une entrée par CHANGEMENT DE DÉCISION (nouvelle clé). Le coureur
+// ne logue que quand sa décision change vraiment (j'attaque la montée, je
+// bascule en récup, je relâche sur le plat final), pas à chaque tick.
+// La déduplication se fait sur `logKey` (signature stable : terrain + zone visée,
+// ou état C2 : c2:chasse, c2:cale…) et NON sur `reason`, qui contient des valeurs
+// mouvantes (distance à l'arrivée, % d'endurance) — sinon une simple progression
+// de 0.1 km créait une fausse entrée toutes les ~10 s, sans changement réel.
+function _logPowerDecision(rider, simSec, reason, logKey) {
   if (!rider.aiLog) rider.aiLog = []
   const last = rider.aiLog[rider.aiLog.length - 1]
-  if (!last || last.phase !== phase) {
-    rider.aiLog.push({ simSec: simSec ?? null, zone: rider.targetZone, aiState: rider.aiState, reason, phase })
+  if (!last || last.logKey !== logKey) {
+    rider.aiLog.push({ simSec: simSec ?? null, zone: rider.targetZone, aiState: rider.aiState, reason, logKey })
     if (rider.aiLog.length > AI_LOG_MAX_ENTRIES) rider.aiLog.shift()
   }
 }

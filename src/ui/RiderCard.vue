@@ -19,6 +19,16 @@
       </span>
     </div>
 
+    <!-- Caractéristiques physiologiques (constantes du coureur) -->
+    <div class="rc-chars">
+      <div class="rc-char"><span class="rc-char-k">Masse</span><span class="rc-char-v">{{ chars.mass }} kg</span></div>
+      <div class="rc-char"><span class="rc-char-k">FTP</span><span class="rc-char-v">{{ chars.ftp }} W</span></div>
+      <div class="rc-char"><span class="rc-char-k">W/kg</span><span class="rc-char-v">{{ chars.wkg }}</span></div>
+      <div class="rc-char"><span class="rc-char-k">W'</span><span class="rc-char-v">{{ chars.wPrime }} kJ</span></div>
+      <div class="rc-char"><span class="rc-char-k">P. anaér.</span><span class="rc-char-v">{{ chars.anaer }} W</span></div>
+      <div class="rc-char"><span class="rc-char-k">Endurance</span><span class="rc-char-v">{{ chars.endF }}</span></div>
+    </div>
+
     <!-- Jauges Endurance / W' -->
     <div class="gauge-block">
       <div class="gauge-header">
@@ -119,6 +129,21 @@ const profileLabel = computed(() =>
 )
 
 const groupLabel = computed(() => GROUP_LABELS[props.rider.group] ?? props.rider.group ?? '—')
+
+// Caractéristiques physiologiques (constantes individuelles — couche 1).
+const chars = computed(() => {
+  const p = props.rider.profile ?? {}
+  const mass = p.mass ?? 75
+  const ftp = p.ftpWatts ?? props.rider.energy?.ftpWatts ?? 0
+  return {
+    mass: Math.round(mass * 10) / 10,
+    ftp: Math.round(ftp),
+    wkg: ftp && mass ? (ftp / mass).toFixed(2) : '—',
+    wPrime: p.wPrimeJ != null ? (p.wPrimeJ / 1000).toFixed(1) : '—',
+    anaer: p.maxAnaerobicPower != null ? Math.round(p.maxAnaerobicPower) : '—',
+    endF: p.enduranceFactor != null ? p.enduranceFactor.toFixed(2) : '—',
+  }
+})
 
 // Badge d'attitude : la zone cible courante du coureur.
 const zoneInfo = computed(() => _zoneById(props.rider.targetZone) ?? ZONES.Z3)
@@ -242,6 +267,30 @@ function formatSimTime(simSec) {
 .rc-badge-muted {
   border-color: rgba(255, 255, 255, 0.2);
   color: rgba(255, 255, 255, 0.5);
+}
+
+/* Caractéristiques physiologiques — grille compacte 2 colonnes */
+.rc-chars {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
+.rc-char { display: flex; justify-content: space-between; align-items: baseline; }
+.rc-char-k {
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.45);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.rc-char-v {
+  font-size: 11px;
+  color: #fff;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Jauges — repris du style HUD (ui/HUD.vue) */

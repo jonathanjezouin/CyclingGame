@@ -255,7 +255,7 @@ describe('projectCost', () => {
   })
 
   it('plus d\'écrans (draft) : effectivePower plus faible → coût W\' projeté réduit', () => {
-    // vFactor=1 dans les deux cas (speedKmh >= 40) pour isoler l'effet du screenCount
+    // abri indépendant de la vitesse (refonte) : on isole l'effet du screenCount
     const noDraft = createRider({ splinePos: 0, screenCount: 0, speedKmh: 45 })
     const drafted = createRider({ splinePos: 0, screenCount: 7, speedKmh: 45 })
 

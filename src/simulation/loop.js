@@ -85,11 +85,14 @@ export class SimulationLoop {
           }
 
           for (const rider of this.riders) {
-            // Couche 1 : décision de ZONE cible avant le tick (joueur exclu —
-            // il pilote sa propre zone via le HUD). decidePowerTarget mute
-            // rider.targetZone et le journal de raisonnement (B1).
+            // Couche 1 : décision solo (terrain, budget W'/endurance). Couche 2 :
+            // réinterprétation par l'abri ambiant (roue devant, abri prospectif).
+            // Joueur exclu — il pilote son propre powerFrac via le HUD.
             if (!rider.isPlayer) {
-              decidePowerTarget(rider, this.route, { simSec: this.elapsedSimSec })
+              decidePowerTarget(rider, this.route, {
+                simSec: this.elapsedSimSec,
+                riders: this.riders,
+              })
             }
             this._interp[rider.id].before = rider.splinePos
             simulateTick(rider, this.route, 1)

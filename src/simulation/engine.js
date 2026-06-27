@@ -760,6 +760,20 @@ const C2_COMFORT_K        = 0.9   // pondère l'inconfort d'être hors de son ry
 const C2_JOIN_CLOSE_SEC   = 4     // horizon de fermeture d'un trou (revenir)
 const C2_MAX_OVERSPEED    = 0.30  // surcoût max (frac) concédé pour revenir/tenir
 
+// ─── R2 — Arbitre de plans (IA Couches v0.2 §2) ─────────────────────────────
+// L'unité de décision n'est pas le watt, c'est le PLAN. Chaque couche propose un
+// plan candidat scoré dans une DEVISE UNIQUE : la fraction de FTP économisée par
+// rapport à la référence C1 (l'instinct solo, score 0 par construction). L'arbitre
+// sélectionne le plan au plus haut score, avec une HYSTÉRÉSIS DE MAINTIEN
+// (transposée du flag latché _recoveringW) : le plan tenu au tick précédent reçoit
+// un bonus, donc une rivale doit le dépasser NETTEMENT pour le détrôner — pas de
+// papillonnage, pas de machine à états. La priorité ne sert qu'au départage à
+// score égal. La sécurité physiologique n'est PAS un plan : c'est un post-clamp
+// (veto hors concours), appliqué après l'arbitrage.
+const HOLD_BONUS = 0.05          // bonus de maintien du plan actif, en devise (frac de FTP)
+const PRIORITY_C1 = 10           // instinct coureur seul (référence)
+const PRIORITY_C2 = 20           // suivre une roue (abri)
+
 // Plafond de zone selon la masse en montée : plus lourd = plafond plus bas.
 // (IA Couches v0.1 §9.1 — « on plafonne selon mass »).
 function _massClimbZoneCap(mass) {
@@ -825,6 +839,51 @@ export function decidePowerTarget(rider, route, context = {}) {
   if (!rider.aiProfile) return rider.powerFrac
 
   const { simSec } = context
+
+  // ── R1 — chaque couche PROPOSE un plan candidat (ne décide pas) ───────────
+  // C1 (instinct solo) est la RÉFÉRENCE de la devise : son plan score 0.
+  const c1 = _planC1(rider, route, context)
+  // C2 (suivre une roue) score son gain net d'abri RELATIF à l'instinct C1.
+  const c2 = _planC2(rider, route, context, c1.target.frac)
+
+  // ── R2 — l'arbitre sélectionne UN plan (score + hystérésis, priorité au départage)
+  const plan = _arbitrate(rider, [c1, c2])
+
+  // ── R3 — contrôleur longitudinal : cible de position → intensité ──────────
+  // Coquille pour cette livraison : le plan porte déjà sa frac (C1/C2 la calculent
+  // aujourd'hui). R3 remplira ce corps (cible long → vitesse requise → powerForSpeed)
+  // et absorbera les micro-corrections reactKmh/corrKmh encore dans _planC2.
+  let target = _controllerLongitudinal(rider, route, plan)
+  let reason = plan.reason
+  let logKey = plan.logKey
+
+  // ── Veto physiologique — POST-CLAMP nommé, hors concours (IA v0.2 §2.3) ────
+  // La sécurité ne SCORE pas contre les plans : elle contraint la commande finale
+  // quel que soit le plan retenu. Explosion = terminal ; récup W' = plafond latché.
+  const veto = _applyPhysioVeto(rider, target)
+  if (veto) { target = veto.target; reason = veto.reason; logKey = veto.logKey }
+
+  // ── Lissage temporel (anti-girouette continu, inchangé) ───────────────────
+  const prev = rider.powerFrac ?? target
+  let next
+  if (target >= prev) {
+    next = prev + (target - prev) * POWER_SMOOTH_UP    // montée douce
+  } else {
+    next = prev + (target - prev) * POWER_SMOOTH_DOWN  // baisse rapide mais lissée
+  }
+
+  rider.powerFrac = next
+  rider.targetZone = getZoneFromFtpRatio(next)     // dérivé pour l'affichage
+  rider.aiState = next >= 1.05 ? 'effort_fort' : next >= 0.80 ? 'soutenu' : 'economie'
+  _logPowerDecision(rider, simSec, reason, logKey)
+  return next
+}
+
+// ─── R1 — Producteur du plan C1 : l'instinct du coureur seul ────────────────
+// Reprend à l'identique la logique par phase de terrain (montée/descente/plat).
+// Ce n'est PAS une machine à états : c'est le calcul de l'intensité-instinct. Son
+// plan est la RÉFÉRENCE de la devise (score 0) ; latéral en mode 'abri' par défaut.
+function _planC1(rider, route, context) {
   const energy = rider.energy
   const prof = rider.profile ?? {}
   const mass = prof.mass ?? 75
@@ -836,22 +895,15 @@ export function decidePowerTarget(rider, route, context = {}) {
     ? Math.max(0, totalLength - rider.splinePos)
     : Infinity
 
-  // Bornes d'intensité (fraction de FTP) accessibles à ce coureur. Le plafond
-  // en montée dépend de la masse : un gabarit lourd ne tient pas aussi haut
-  // au-dessus du seuil qu'un grimpeur léger (et donc décroche).
   const climbCeil = _massPowerCeil(mass)   // ex. léger 1.15, lourd 1.00
 
   let target           // fraction de FTP visée
   let reason           // texte d'affichage (peut contenir des valeurs mouvantes)
-  let logKey           // clé de déduplication du journal (PAS une machine d'états :
-                       // les décisions viennent de C1/C2, ceci ne fait qu'étiqueter)
+  let logKey           // clé de déduplication du journal (étiquette de phase)
 
   if (gradient >= 2) {
     // ── MONTÉE : gestion de budget continue ───────────────────────────────
-    // Marge de sécurité : on ne vide pas tout le W' (cycliste prudent).
     const SAFETY = 0.12
-    // Ascensions encore à venir APRÈS celle-ci : on réserve une part du W' pour
-    // elles (plus il en reste, moins on engage maintenant).
     const after = upcomingAscents(route, rider.splinePos)
       .filter(a => !(rider.splinePos >= a.from && rider.splinePos < a.to)).length
     const reserveForLater = Math.min(0.5, after * 0.25)
@@ -859,20 +911,15 @@ export function decidePowerTarget(rider, route, context = {}) {
     const wAvail = energy.wPrime.current
     const wBudget = Math.max(0, wAvail - (SAFETY + reserveForLater) * energy.wPrime.max)
 
-    // Temps estimé jusqu'au sommet de l'ascension entière, à la vitesse courante.
     const remainM = _remainingClimbM(route, rider.splinePos) ?? 600
     const vMs = Math.max(2, (rider.speedKmh ?? 0) / 3.6)
     const timeToTopSec = Math.max(1, remainM / vMs)
 
-    // Puissance excédentaire (au-dessus du FTP) finançable par le budget sur ce
-    // temps : excessW = wBudget / timeToTop. La cible = FTP + cet excédent.
     const excessW = wBudget / timeToTopSec
     let frac = 1 + excessW / ftp                 // continu, pas de palier
     frac = Math.min(frac, climbCeil)             // plafond masse
     frac = Math.max(frac, 0.90)                  // en montée on est au moins proche du seuil
 
-    // Relance de fin : si le sommet est proche (< 1.2 km) et qu'il reste du W',
-    // on « finit » la cartouche — petit coup de collier.
     if (remainM < 1200 && wBal > 0.15 && after === 0) {
       frac = Math.min(climbCeil + 0.05, frac + 0.10)
     }
@@ -885,21 +932,14 @@ export function decidePowerTarget(rider, route, context = {}) {
              `${Math.round(frac*100)}% FTP (W' réparti jusqu'au sommet, ${wkg} W/kg` +
              `${after ? `, ${after} ascension(s) après` : ''}${finishing ? ', relance finale' : ''}).`
   } else if (gradient <= -3) {
-    // ── DESCENTE : on ne force pas trop (le gain de vitesse coûte cher en watts
-    //    à cause de l'aéro), mais on PÉDALE quand même pour ne pas tout rendre —
-    //    un grimpeur qui a pris du temps en montée défend sa position. C'est en
-    //    descente que les gabarits lourds reprennent naturellement (gravité), on
-    //    limite la casse sans gaspiller.
+    // ── DESCENTE : on garde du rythme sans gaspiller ──────────────────────
     target = 0.72
     logKey = 'descente'
     reason = `Descente ${gradient.toFixed(1)}% → on garde du rythme (${Math.round(target*100)}% FTP).`
   } else {
-    // ── PLAT / FAUX-PLAT : intensité d'endurance ───────────────────────────
-    // Plus rien de difficile derrière + arrivée pas si loin → on relâche ce qui
-    // reste (endurance) ; sinon croisière prudente.
+    // ── PLAT / FAUX-PLAT : intensité d'endurance ──────────────────────────
     const ascentsLeft = upcomingAscents(route, rider.splinePos).length
     if (ascentsLeft === 0 && distanceToFinish < 8000) {
-      // Fin de course sans difficulté : on lâche les watts qu'on a encore.
       const endFrac = energy.endurance.current / energy.endurance.max
       target = 0.80 + 0.25 * Math.max(0, endFrac)    // jusqu'à ~1.05 si réservoir plein
       target = Math.min(target, 1.05)
@@ -914,140 +954,160 @@ export function decidePowerTarget(rider, route, context = {}) {
     }
   }
 
-  // ── Couche 2 — arbitrage unique par les vitesses (abri ambiant) ─────────
-  // C1 a posé l'instinct solo (fracSolo). C2 compare la vitesse de la roue
-  // devant à ma vitesse-instinct et décide : suivre (adopter sa vitesse, abri)
-  // ou rouler à mon rythme (et déborder si je vais vraiment plus vite). Pas de
-  // cas pente : l'abri fond en montée via le facteur v², donc le grimpeur lâche
-  // la roue tout seul. La sécurité (W'/explosion) garde le dernier mot (bloc
-  // suivant) ; on ne touche pas un coureur explosé.
-  const fracSolo = target
+  return {
+    target: { long: rider.splinePos, frac: target, lat: { mode: 'abri' } },
+    score: 0,                  // RÉFÉRENCE : l'instinct est l'ancre de la devise
+    priority: PRIORITY_C1,
+    reason, logKey
+  }
+}
+
+// ─── R1 — Producteur du plan C2 : suivre une roue quand l'abri le vaut ──────
+// Reprend l'arbitrage par les vitesses (shelterGain vs discomfort) à l'identique.
+// Différence avec l'ancien code : au lieu d'un booléen followIsWorth qui ÉCRASE
+// la cible, on renvoie un plan SCORÉ (shelterGain − discomfort) en concurrence.
+// Latéral en mode 'roue' (coordonnée = le coureur suivi). Retourne null si aucune
+// roue n'est une cible pertinente (pas de plan candidat ce tick).
+function _planC2(rider, route, context, fracSolo) {
+  const energy = rider.energy
   const riders = context.riders
-  if (riders && riders.length > 1 && !energy.exploded) {
-    const ahead = nearestRiderAhead(rider, riders)
-    if (ahead && ahead.gap <= C2_CHASE_MAX_GAP_M) {
-      const myMass   = rider.profile?.mass
-      const myV      = Math.max(1, rider.speedKmh ?? 1)
-      const wheelV   = Math.max(1, ahead.rider.speedKmh ?? myV)
-      // Vitesse "instinct" C1 : celle que je tiendrais SEUL à fracSolo (sans abri).
-      const ftpW     = energy.ftpWatts * (energy.dayFormMod ?? 1)
-      const soloV    = computeSpeed(fracSolo * ftpW, gradient, 0, 1, myMass)
+  if (energy.exploded) return null
+  if (!riders || riders.length <= 1) return null
 
-      // Économie d'abri SI je roule à la vitesse de la roue : puissance pour
-      // tenir wheelV avec draft vs sans draft. Le draft (donc l'économie) dépend
-      // de la vitesse → fond en montée. C'est tout le ressort du comportement.
-      const draftFrac   = draftReduction(rider.screenCount ?? 0, wheelV) // 0..0.54
-      const pNoDraft    = powerForSpeed(wheelV, gradient, 1, myMass)
-      const pDraft      = powerForSpeed(wheelV, gradient, 1 - draftFrac, myMass)
-      const shelterGain = Math.max(0, (pNoDraft - pDraft) / Math.max(1, ftpW)) // en frac de FTP
+  const gradient = route?.getGradientAt ? route.getGradientAt(rider.splinePos) : 0
+  const ahead = nearestRiderAhead(rider, riders)
+  if (!ahead || ahead.gap > C2_CHASE_MAX_GAP_M) {
+    rider._prevGapAhead = ahead ? ahead.gap : undefined
+    return null
+  }
 
-      // Inconfort d'être hors de mon rythme : |vitesse de la roue − mon instinct|,
-      // rapporté à mon instinct, pondéré. Suivre une roue trop lente OU trop
-      // rapide coûte ; l'abri doit compenser.
-      const mismatch  = Math.abs(wheelV - soloV) / Math.max(1, soloV)
-      const discomfort = C2_COMFORT_K * mismatch
+  const myMass   = rider.profile?.mass
+  const myV      = Math.max(1, rider.speedKmh ?? 1)
+  const wheelV   = Math.max(1, ahead.rider.speedKmh ?? myV)
+  const ftpW     = energy.ftpWatts * (energy.dayFormMod ?? 1)
+  const soloV    = computeSpeed(fracSolo * ftpW, gradient, 0, 1, myMass)
 
-      const followIsWorth = shelterGain >= discomfort
+  const draftFrac   = draftReduction(rider.screenCount ?? 0, wheelV) // 0..0.54
+  const pNoDraft    = powerForSpeed(wheelV, gradient, 1, myMass)
+  const pDraft      = powerForSpeed(wheelV, gradient, 1 - draftFrac, myMass)
+  const shelterGain = Math.max(0, (pNoDraft - pDraft) / Math.max(1, ftpW)) // frac de FTP
 
-      // Réactivité : un coureur frais matche vite une accélération ; W' bas = plus mou.
-      const wRatio = energy.wPrime.current / Math.max(1, energy.wPrime.max)
-      const react  = C2_REACT_UP * (wRatio < 0.3 ? C2_REACT_W_FATIGUE : 1)
+  const mismatch  = Math.abs(wheelV - soloV) / Math.max(1, soloV)
+  const discomfort = C2_COMFORT_K * mismatch
 
-      if (ahead.gap > C2_IN_WHEEL_GAP_M) {
-        // ── PAS ENCORE DANS LA ROUE ──────────────────────────────────────────
-        // Si la suivre vaut le coup, je reviens : je vise la vitesse de la roue
-        // + le surplus nécessaire pour refermer le trou en ~JOIN_CLOSE_SEC.
-        if (followIsWorth) {
-          const closeVMs = (ahead.gap - C2_FOLLOW_DIST_M) / C2_JOIN_CLOSE_SEC // m/s à rattraper
-          const targetVKmh = wheelV + Math.max(0, closeVMs * 3.6)
-          const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
-          const overFrac = Math.min(C2_MAX_OVERSPEED, Math.max(0, pNeed / ftpW - fracSolo))
-          target = fracSolo + overFrac
-          logKey = 'c2:reviens'
-          reason = `Roue devant à ${Math.round(ahead.gap)} m, ça vaut l'abri → ` +
-                   `+${Math.round(overFrac*100)}% pour revenir (gain abri ${(shelterGain*100).toFixed(0)}%).`
-        } else {
-          // Pas rentable de revenir : je roule à mon instinct.
-          logKey = 'c2:mon_rythme'
-          reason = `Roue devant à ${Math.round(ahead.gap)} m mais peu d'abri ici ` +
-                   `(${(shelterGain*100).toFixed(0)}%) → je roule à mon rythme (${Math.round(fracSolo*100)}% FTP).`
-        }
-      } else {
-        // ── DANS LA ROUE ─────────────────────────────────────────────────────
-        if (followIsWorth) {
-          // Je tiens la roue : cible = SA vitesse (l'abri rend ça moins cher que
-          // mon instinct), + réaction immédiate si elle accélère (le trou s'ouvre,
-          // dGap>0) atténuée par la fatigue, + petite correction de distance de
-          // suivi. On ne vise jamais "passer" : on vise tenir FOLLOW_DIST derrière.
-          const prevGap = rider._prevGapAhead
-          const dGap = Number.isFinite(prevGap) ? (ahead.gap - prevGap) : 0
-          const distErr = ahead.gap - C2_FOLLOW_DIST_M            // >0 = trop loin, je relance un peu
-          const reactKmh = Math.max(0, dGap) * react * 3.6        // réaction à l'accélération
-          const corrKmh  = Math.max(-2, Math.min(4, distErr)) * 0.4
-          const targetVKmh = wheelV + reactKmh + corrKmh
-          const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
-          target = Math.max(0.50, Math.min(1.50, pNeed / ftpW))
-          logKey = 'c2:roue'
-          reason = `Dans la roue (${ahead.gap.toFixed(1)} m) → je tiens sa vitesse ` +
-                   `${wheelV.toFixed(0)} km/h à ${Math.round(target*100)}% FTP` +
-                   `${dGap > 0.3 ? ' (elle accélère, je réagis)' : ''}.`
-          rider._prevGapAhead = ahead.gap
-        } else {
-          // La roue ne vaut plus l'abri (trop lente/rapide pour moi ici, ex.
-          // grimpeur en côte) → je roule à mon rythme. Si soloV > wheelV, je
-          // déborde mécaniquement (légitime, vraie différence de rythme).
-          logKey = soloV > wheelV + 0.5 ? 'c2:deborde' : 'c2:mon_rythme'
-          const verb = soloV > wheelV + 0.5 ? 'je déborde et passe' : 'je roule à mon rythme'
-          reason = `Roue devant peu rentable ici (abri ${(shelterGain*100).toFixed(0)}%, ` +
-                   `inconfort ${(discomfort*100).toFixed(0)}%) → ${verb} (${Math.round(fracSolo*100)}% FTP).`
-          rider._prevGapAhead = ahead.gap
-        }
-      }
+  // DEVISE : gain net d'abri vs l'instinct C1. ≥ 0 ≡ ancien followIsWorth=true.
+  const score = shelterGain - discomfort
+
+  const wRatio = energy.wPrime.current / Math.max(1, energy.wPrime.max)
+  const react  = C2_REACT_UP * (wRatio < 0.3 ? C2_REACT_W_FATIGUE : 1)
+
+  let frac, reason, logKey
+
+  if (ahead.gap > C2_IN_WHEEL_GAP_M) {
+    // ── PAS ENCORE DANS LA ROUE ─────────────────────────────────────────────
+    // Le plan "revenir" n'a de sens que si l'abri le vaut. Sinon on ne propose
+    // PAS de plan C2 (l'instinct C1 l'emportera naturellement).
+    if (score < 0) {
+      rider._prevGapAhead = ahead.gap
+      return null
+    }
+    const closeVMs = (ahead.gap - C2_FOLLOW_DIST_M) / C2_JOIN_CLOSE_SEC // m/s à rattraper
+    const targetVKmh = wheelV + Math.max(0, closeVMs * 3.6)
+    const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
+    const overFrac = Math.min(C2_MAX_OVERSPEED, Math.max(0, pNeed / ftpW - fracSolo))
+    frac = fracSolo + overFrac
+    logKey = 'c2:reviens'
+    reason = `Roue devant à ${Math.round(ahead.gap)} m, ça vaut l'abri → ` +
+             `+${Math.round(overFrac*100)}% pour revenir (gain abri ${(shelterGain*100).toFixed(0)}%).`
+  } else {
+    // ── DANS LA ROUE ────────────────────────────────────────────────────────
+    if (score >= 0) {
+      const prevGap = rider._prevGapAhead
+      const dGap = Number.isFinite(prevGap) ? (ahead.gap - prevGap) : 0
+      const distErr = ahead.gap - C2_FOLLOW_DIST_M            // >0 = trop loin
+      const reactKmh = Math.max(0, dGap) * react * 3.6        // réaction à l'accélération
+      const corrKmh  = Math.max(-2, Math.min(4, distErr)) * 0.4
+      const targetVKmh = wheelV + reactKmh + corrKmh
+      const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
+      frac = Math.max(0.50, Math.min(1.50, pNeed / ftpW))
+      logKey = 'c2:roue'
+      reason = `Dans la roue (${ahead.gap.toFixed(1)} m) → je tiens sa vitesse ` +
+               `${wheelV.toFixed(0)} km/h à ${Math.round(frac*100)}% FTP` +
+               `${dGap > 0.3 ? ' (elle accélère, je réagis)' : ''}.`
+      rider._prevGapAhead = ahead.gap
     } else {
-      rider._prevGapAhead = ahead ? ahead.gap : undefined
+      // La roue ne vaut plus l'abri → pas de plan C2 ; l'instinct C1 reprend la
+      // main (et déborde mécaniquement si soloV > wheelV). On journalise tout de
+      // même la NATURE du non-suivi via le logKey, pour préserver le journal B1.
+      rider._prevGapAhead = ahead.gap
+      logKey = soloV > wheelV + 0.5 ? 'c2:deborde' : 'c2:mon_rythme'
+      const verb = soloV > wheelV + 0.5 ? 'je déborde et passe' : 'je roule à mon rythme'
+      reason = `Roue devant peu rentable ici (abri ${(shelterGain*100).toFixed(0)}%, ` +
+               `inconfort ${(discomfort*100).toFixed(0)}%) → ${verb} (${Math.round(fracSolo*100)}% FTP).`
+      // Plan "ne pas suivre mais pertinent" (déborde / mon rythme) : même cible que
+      // l'instinct (frac solo), donc score 0 — ÉGALITÉ avec C1, pas pire. La priorité
+      // (C2 > C1) le fait surfacer au journal : dès qu'une roue est à portée, c'est
+      // elle qui mène l'explication (« je déborde »), pas le bare 'montee:zX' de C1.
+      // Latéral 'abri' (je ne colle aucune roue).
+      return {
+        target: { long: rider.splinePos, frac: fracSolo, lat: { mode: 'abri' } },
+        score: 0, priority: PRIORITY_C2, reason, logKey
+      }
     }
   }
 
-  // ── Sécurité W' / explosion (prioritaire) ───────────────────────────────
-  // Hystérésis sur la récupération W' : on ENTRE en récup sous WBAL_DROP_BELOW
-  // (15%) et on n'en SORT qu'au-dessus de WBAL_RECOVER_EXIT (30%). Sans cette
-  // bande morte, lever le pied remontait aussitôt le W' au-dessus de 15%, donc
-  // on repartait à fond au tick suivant, qui le revidait… → oscillation
-  // 113%→80%→113% par seconde. Le flag latché transforme ça en un vrai cycle
-  // « je me mets en dedans / je récupère / je repars » de plusieurs secondes.
+  return {
+    target: { long: ahead.rider.splinePos, frac, lat: { mode: 'roue', wheelId: ahead.rider.id } },
+    score, priority: PRIORITY_C2, reason, logKey
+  }
+}
+
+// ─── R2 — L'arbitre : sélectionne UN plan parmi les candidats ───────────────
+// Score (devise unique) + HYSTÉRÉSIS DE MAINTIEN (le plan actif au tick précédent
+// reçoit HOLD_BONUS → une rivale doit le dépasser nettement). Priorité au départage
+// à score égal. Pas de durée fixe, pas de transition explicite : la stabilité naît
+// du bonus de score (pattern latché _recoveringW transposé au niveau stratégie).
+function _arbitrate(rider, plans) {
+  const valid = plans.filter(Boolean)
+  for (const p of valid) {
+    p._effScore = p.score + (p.logKey === rider._activePlanKey ? HOLD_BONUS : 0)
+  }
+  valid.sort((a, b) => (b._effScore - a._effScore) || (b.priority - a.priority))
+  const winner = valid[0]
+  rider._activePlanKey = winner.logKey
+  return winner
+}
+
+// ─── R3 — Contrôleur longitudinal (coquille pour cette livraison) ───────────
+// Cible : cible de position → vitesse requise → powerForSpeed → frac. Aujourd'hui
+// le plan porte déjà sa frac (C1/C2 la calculent), donc pass-through. La place est
+// nommée et réservée pour que R3 remplisse ce corps sans toucher l'orchestrateur.
+function _controllerLongitudinal(rider, route, plan) {
+  return plan.target.frac
+}
+
+// ─── Veto physiologique — post-clamp nommé (hors concours) ──────────────────
+// Retourne un override { target, reason, logKey } si la sécurité doit contraindre
+// la commande, sinon null. Explosion = terminal (0.50 forcé). Récupération W' =
+// plafond 0.80, latché par hystérésis 15%/30% (la bande morte évite l'oscillation
+// « lever le pied remonte W' au-dessus de 15%, je repars à fond, je revide »).
+function _applyPhysioVeto(rider, target) {
+  const energy = rider.energy
+  const wBal = energy.wPrime.current / energy.wPrime.max
   if (energy.exploded) {
-    target = 0.50
     rider._recoveringW = false
-    logKey = 'explose'
-    reason = `Explosion Endurance → ${Math.round(target*100)}% FTP forcé (irréversible).`
-  } else {
-    if (wBal < WBAL_DROP_BELOW) rider._recoveringW = true
-    else if (wBal >= WBAL_RECOVER_EXIT) rider._recoveringW = false
-    if (rider._recoveringW) {
-      target = Math.min(target, 0.80)
-      logKey = 'recup_w'
-      reason = `Réserve W' basse (${_pct(wBal)}%) → ${Math.round(target*100)}% FTP, je récupère jusqu'à ${Math.round(WBAL_RECOVER_EXIT*100)}%.`
+    return { target: 0.50, reason: `Explosion Endurance → 50% FTP forcé (irréversible).`, logKey: 'explose' }
+  }
+  if (wBal < WBAL_DROP_BELOW) rider._recoveringW = true
+  else if (wBal >= WBAL_RECOVER_EXIT) rider._recoveringW = false
+  if (rider._recoveringW) {
+    return {
+      target: Math.min(target, 0.80),
+      reason: `Réserve W' basse (${_pct(wBal)}%) → ${Math.round(Math.min(target,0.80)*100)}% FTP, je récupère jusqu'à ${Math.round(WBAL_RECOVER_EXIT*100)}%.`,
+      logKey: 'recup_w'
     }
   }
-
-  // ── Lissage temporel (anti-girouette continu) ───────────────────────────
-  // On lisse la fraction vers la cible. La hausse est amortie (montée
-  // progressive de l'effort). La baisse est plus rapide mais PAS instantanée :
-  // un lissage descendant évite les à-coups (le claquement 113%→80% vu au log)
-  // tout en restant réactif pour la sécurité.
-  const prev = rider.powerFrac ?? target
-  let next
-  if (target >= prev) {
-    next = prev + (target - prev) * POWER_SMOOTH_UP    // montée douce
-  } else {
-    next = prev + (target - prev) * POWER_SMOOTH_DOWN  // baisse rapide mais lissée
-  }
-
-  rider.powerFrac = next
-  rider.targetZone = getZoneFromFtpRatio(next)     // dérivé pour l'affichage
-  rider.aiState = next >= 1.05 ? 'effort_fort' : next >= 0.80 ? 'soutenu' : 'economie'
-  _logPowerDecision(rider, simSec, reason, logKey)
-  return next
+  return null
 }
 
 // Plafond d'intensité (fraction de FTP) tenable en montée selon la masse.

@@ -206,17 +206,22 @@ describe('Couche 2 — tenue de roue & journal', () => {
     expect(me.aiLog[me.aiLog.length - 1].logKey).toBe('c2:roue')
   })
 
-  it('journalise une transition d\'état (revenir → dans la roue)', () => {
+  it('suit une roue lointaine-mais-rentable et une roue proche sous le même plan (c2:roue fusionné)', () => {
+    // R3 : 'reviens' et 'roue' sont FUSIONNÉS — même cible (« être à gapCible
+    // derrière X »), le contrôleur gère le continuum de gap. La distinction
+    // revenir/dans-la-roue vit désormais dans le texte (reason), pas dans le logKey.
     const route = flatRoute()
     const me = mkRider({ splinePos: 1000 }); me.id = 'me'; me.speedKmh = 38
     me.screenCount = 2; me.aiLog = []
-    let ahead = mkRider({ splinePos: 1040 }); ahead.id = 'ahead'; ahead.speedKmh = 40 // loin
+    let ahead = mkRider({ splinePos: 1040 }); ahead.id = 'ahead'; ahead.speedKmh = 40 // loin mais rentable
     decidePowerTarget(me, route, { simSec: 10, riders: [me, ahead] })
-    const keysFar = me.aiLog.map(e => e.logKey).join(' ')
+    const keyFar = me.aiLog[me.aiLog.length - 1].logKey
+    const reasonFar = me.aiLog[me.aiLog.length - 1].reason
     ahead = mkRider({ splinePos: 1003 }); ahead.id = 'ahead'; ahead.speedKmh = 40     // dans la roue
     decidePowerTarget(me, route, { simSec: 12, riders: [me, ahead] })
-    const last = me.aiLog[me.aiLog.length - 1].logKey
-    expect(keysFar).toMatch(/c2:(reviens|mon_rythme)/)
-    expect(last).toBe('c2:roue')
+    const keyNear = me.aiLog[me.aiLog.length - 1].logKey
+    expect(keyFar).toBe('c2:roue')                 // plan de suivi dans les deux cas
+    expect(keyNear).toBe('c2:roue')
+    expect(reasonFar).toMatch(/reviens/)           // mais le texte distingue « je reviens »
   })
 })

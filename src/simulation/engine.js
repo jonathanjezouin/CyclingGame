@@ -752,13 +752,13 @@ const ZONE_COMMIT_TICKS = 5
 // vite. Le comportement terrain (grimpeur qui lâche la roue en côte, calage sur
 // le plat) ÉMERGE de cet arbitrage — aucune règle si-pente.
 const C2_FOLLOW_DIST_M    = 2.0   // distance de suivi cible derrière la roue (~1 longueur + jeu)
-const C2_IN_WHEEL_GAP_M   = 12    // au-delà, je ne suis plus "dans la roue" : je dois revenir
+const C2_IN_WHEEL_GAP_M   = 12    // seuil "dans la roue" vs "je reviens" — libellé journal B1
 const C2_CHASE_MAX_GAP_M  = 150   // au-delà, une roue isolée n'est plus une cible
 const C2_REACT_UP         = 0.40  // réactivité à une accélération de la roue (frais)
 const C2_REACT_W_FATIGUE  = 0.55  // facteur de réactivité quand le W' est bas (< plus mou)
-const C2_COMFORT_K        = 0.9   // pondère l'inconfort d'être hors de son rythme C1
-const C2_JOIN_CLOSE_SEC   = 4     // horizon de fermeture d'un trou (revenir)
-const C2_MAX_OVERSPEED    = 0.30  // surcoût max (frac) concédé pour revenir/tenir
+// (R3) C2_COMFORT_K / C2_JOIN_CLOSE_SEC / C2_MAX_OVERSPEED retirés : le score passe
+// en devise pure (powerForSpeed) et le rattrapage est régulé en continu par le
+// contrôleur longitudinal (plus de cap d'over-speed ni d'horizon de fermeture fixe).
 
 // ─── R2 — Arbitre de plans (IA Couches v0.2 §2) ─────────────────────────────
 // L'unité de décision n'est pas le watt, c'est le PLAN. Chaque couche propose un
@@ -850,10 +850,10 @@ export function decidePowerTarget(rider, route, context = {}) {
   const plan = _arbitrate(rider, [c1, c2])
 
   // ── R3 — contrôleur longitudinal : cible de position → intensité ──────────
-  // Coquille pour cette livraison : le plan porte déjà sa frac (C1/C2 la calculent
-  // aujourd'hui). R3 remplira ce corps (cible long → vitesse requise → powerForSpeed)
-  // et absorbera les micro-corrections reactKmh/corrKmh encore dans _planC2.
-  let target = _controllerLongitudinal(rider, route, plan)
+  // Le plan actif porte une cible (libre pour C1, position-de-roue pour C2). Le
+  // contrôleur en dérive la frac : pass-through pour une cible libre, régulation
+  // de distance (reactKmh/corrKmh) pour une cible de roue. SEUL producteur de watts.
+  let target = _controllerLongitudinal(rider, route, plan, context)
   let reason = plan.reason
   let logKey = plan.logKey
 
@@ -986,78 +986,62 @@ function _planC2(rider, route, context, fracSolo) {
   const wheelV   = Math.max(1, ahead.rider.speedKmh ?? myV)
   const ftpW     = energy.ftpWatts * (energy.dayFormMod ?? 1)
   const soloV    = computeSpeed(fracSolo * ftpW, gradient, 0, 1, myMass)
+  const draftFrac = draftReduction(rider.screenCount ?? 0, wheelV) // 0..0.54
 
-  const draftFrac   = draftReduction(rider.screenCount ?? 0, wheelV) // 0..0.54
-  const pNoDraft    = powerForSpeed(wheelV, gradient, 1, myMass)
-  const pDraft      = powerForSpeed(wheelV, gradient, 1 - draftFrac, myMass)
-  const shelterGain = Math.max(0, (pNoDraft - pDraft) / Math.max(1, ftpW)) // frac de FTP
+  // DEVISE PURE CORRIGÉE (R3) — homogène en frac de FTP, tout via powerForSpeed,
+  // mais en mesurant les DEUX bonnes grandeurs à vitesse contrôlée (et non le coût
+  // brut de deux vitesses différentes, qui dirait trivialement « rouler moins vite
+  // coûte moins » et empêcherait le grimpeur de lâcher une roue lente) :
+  //   draftSaving  = économie d'abri À LA VITESSE DE LA ROUE (s'effondre en côte
+  //                  car draftFrac→0 via v² — l'émergence montagne est préservée).
+  //   mismatchCost = effort que je RETIENS en me calant sur une roue plus lente que
+  //                  mon instinct = coût d'opportunité (pfs(soloV) − pfs(wheelV)),
+  //                  borné ≥ 0 (suivre une roue plus RAPIDE n'est pas un « coût »).
+  // score = draftSaving − mismatchCost. >0 ⟺ l'abri vaut le renoncement de rythme.
+  const pfsWheelNoDraft = powerForSpeed(wheelV, gradient, 1,             myMass)
+  const pfsWheelDraft   = powerForSpeed(wheelV, gradient, 1 - draftFrac, myMass)
+  const pfsSoloNoDraft  = powerForSpeed(soloV,  gradient, 1,             myMass)
+  const draftSaving  = Math.max(0, (pfsWheelNoDraft - pfsWheelDraft) / ftpW)
+  const mismatchCost = Math.max(0, (pfsSoloNoDraft  - pfsWheelNoDraft) / ftpW)
+  const shelterGain  = draftSaving                 // pour le journal B1
+  const score = draftSaving - mismatchCost
 
-  const mismatch  = Math.abs(wheelV - soloV) / Math.max(1, soloV)
-  const discomfort = C2_COMFORT_K * mismatch
-
-  // DEVISE : gain net d'abri vs l'instinct C1. ≥ 0 ≡ ancien followIsWorth=true.
-  const score = shelterGain - discomfort
-
-  const wRatio = energy.wPrime.current / Math.max(1, energy.wPrime.max)
-  const react  = C2_REACT_UP * (wRatio < 0.3 ? C2_REACT_W_FATIGUE : 1)
-
-  let frac, reason, logKey
-
-  if (ahead.gap > C2_IN_WHEEL_GAP_M) {
-    // ── PAS ENCORE DANS LA ROUE ─────────────────────────────────────────────
-    // Le plan "revenir" n'a de sens que si l'abri le vaut. Sinon on ne propose
-    // PAS de plan C2 (l'instinct C1 l'emportera naturellement).
-    if (score < 0) {
-      rider._prevGapAhead = ahead.gap
-      return null
-    }
-    const closeVMs = (ahead.gap - C2_FOLLOW_DIST_M) / C2_JOIN_CLOSE_SEC // m/s à rattraper
-    const targetVKmh = wheelV + Math.max(0, closeVMs * 3.6)
-    const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
-    const overFrac = Math.min(C2_MAX_OVERSPEED, Math.max(0, pNeed / ftpW - fracSolo))
-    frac = fracSolo + overFrac
-    logKey = 'c2:reviens'
-    reason = `Roue devant à ${Math.round(ahead.gap)} m, ça vaut l'abri → ` +
-             `+${Math.round(overFrac*100)}% pour revenir (gain abri ${(shelterGain*100).toFixed(0)}%).`
-  } else {
-    // ── DANS LA ROUE ────────────────────────────────────────────────────────
-    if (score >= 0) {
-      const prevGap = rider._prevGapAhead
-      const dGap = Number.isFinite(prevGap) ? (ahead.gap - prevGap) : 0
-      const distErr = ahead.gap - C2_FOLLOW_DIST_M            // >0 = trop loin
-      const reactKmh = Math.max(0, dGap) * react * 3.6        // réaction à l'accélération
-      const corrKmh  = Math.max(-2, Math.min(4, distErr)) * 0.4
-      const targetVKmh = wheelV + reactKmh + corrKmh
-      const pNeed = powerForSpeed(targetVKmh, gradient, 1 - draftFrac, myMass)
-      frac = Math.max(0.50, Math.min(1.50, pNeed / ftpW))
-      logKey = 'c2:roue'
-      reason = `Dans la roue (${ahead.gap.toFixed(1)} m) → je tiens sa vitesse ` +
-               `${wheelV.toFixed(0)} km/h à ${Math.round(frac*100)}% FTP` +
-               `${dGap > 0.3 ? ' (elle accélère, je réagis)' : ''}.`
-      rider._prevGapAhead = ahead.gap
-    } else {
-      // La roue ne vaut plus l'abri → pas de plan C2 ; l'instinct C1 reprend la
-      // main (et déborde mécaniquement si soloV > wheelV). On journalise tout de
-      // même la NATURE du non-suivi via le logKey, pour préserver le journal B1.
-      rider._prevGapAhead = ahead.gap
-      logKey = soloV > wheelV + 0.5 ? 'c2:deborde' : 'c2:mon_rythme'
-      const verb = soloV > wheelV + 0.5 ? 'je déborde et passe' : 'je roule à mon rythme'
-      reason = `Roue devant peu rentable ici (abri ${(shelterGain*100).toFixed(0)}%, ` +
-               `inconfort ${(discomfort*100).toFixed(0)}%) → ${verb} (${Math.round(fracSolo*100)}% FTP).`
-      // Plan "ne pas suivre mais pertinent" (déborde / mon rythme) : même cible que
-      // l'instinct (frac solo), donc score 0 — ÉGALITÉ avec C1, pas pire. La priorité
-      // (C2 > C1) le fait surfacer au journal : dès qu'une roue est à portée, c'est
-      // elle qui mène l'explication (« je déborde »), pas le bare 'montee:zX' de C1.
-      // Latéral 'abri' (je ne colle aucune roue).
-      return {
-        target: { long: rider.splinePos, frac: fracSolo, lat: { mode: 'abri' } },
-        score: 0, priority: PRIORITY_C2, reason, logKey
-      }
+  if (score < 0) {
+    // ── C2 DÉCLINE mais reste pertinent (déborde / mon rythme) ──────────────
+    // Cible LIBRE (long:null) = l'instinct ; score 0 (égalité C1) ; la priorité
+    // C2>C1 fait surfacer l'explication au journal B1. Latéral 'abri'.
+    // On n'est PAS en mode roue ce tick → on oublie le gap (évite un dGap fantôme
+    // au prochain accrochage). C'est le reset (b) validé.
+    rider._prevGapAhead = undefined
+    const logKey = soloV > wheelV + 0.5 ? 'c2:deborde' : 'c2:mon_rythme'
+    const verb   = soloV > wheelV + 0.5 ? 'je déborde et passe' : 'je roule à mon rythme'
+    const reason = `Roue devant peu rentable (abri ${Math.round(draftSaving*100)}% ` +
+                   `< renoncement ${Math.round(mismatchCost*100)}%) → ${verb}.`
+    return {
+      target: { long: null, frac: fracSolo, lat: { mode: 'abri' } },
+      score: 0, priority: PRIORITY_C2, reason, logKey
     }
   }
 
+  // ── C2 SUIT : plan à cible de POSITION relative ───────────────────────────
+  // 'reviens' et 'roue' FUSIONNÉS : la cible est toujours « être à gapCible
+  // derrière X ». Le gap courant n'est qu'un état ; le contrôleur longitudinal
+  // (R3) régule l'effort pour rejoindre/tenir — c'est lui qui produit les watts.
+  // _planC2 ne calcule plus AUCUN watt de commande (seulement le score).
+  const onWheel = ahead.gap <= C2_IN_WHEEL_GAP_M
+  const logKey = 'c2:roue'
+  const reason = onWheel
+    ? `Dans la roue de ${ahead.rider.name ?? 'X'} (${ahead.gap.toFixed(1)} m) → je vise sa position ` +
+      `(gain abri ${Math.round(shelterGain*100)}%).`
+    : `Roue de ${ahead.rider.name ?? 'X'} à ${Math.round(ahead.gap)} m → je reviens dans sa position ` +
+      `(gain abri ${Math.round(shelterGain*100)}%).`
+
   return {
-    target: { long: ahead.rider.splinePos, frac, lat: { mode: 'roue', wheelId: ahead.rider.id } },
+    target: {
+      long: { followId: ahead.rider.id, gapCible: C2_FOLLOW_DIST_M },
+      frac: fracSolo,                              // repli si la roue disparaît
+      lat:  { mode: 'roue', wheelId: ahead.rider.id }
+    },
     score, priority: PRIORITY_C2, reason, logKey
   }
 }
@@ -1078,12 +1062,50 @@ function _arbitrate(rider, plans) {
   return winner
 }
 
-// ─── R3 — Contrôleur longitudinal (coquille pour cette livraison) ───────────
-// Cible : cible de position → vitesse requise → powerForSpeed → frac. Aujourd'hui
-// le plan porte déjà sa frac (C1/C2 la calculent), donc pass-through. La place est
-// nommée et réservée pour que R3 remplisse ce corps sans toucher l'orchestrateur.
-function _controllerLongitudinal(rider, route, plan) {
-  return plan.target.frac
+// ─── R3 — Contrôleur longitudinal : cible de position → watts ───────────────
+// SEUL lieu qui produit des watts de commande. Traduit la cible du plan actif en
+// fraction de FTP. Deux cas :
+//   • cible LIBRE (long:null) — C1, ou C2 qui décline : la frac d'instinct EST la
+//     commande (pass-through).
+//   • cible de ROUE (long:{followId,gapCible}) — régulation de distance vers le
+//     point « gapCible m derrière le coureur suivi ». C'est ici que vivent
+//     désormais reactKmh (réaction à l'accélération de la roue) et corrKmh
+//     (correction de distance) — la dette identifiée, sortie de _planC2 (R3).
+function _controllerLongitudinal(rider, route, plan, context) {
+  const tgt = plan.target.long
+
+  // Cible libre : l'instinct est la commande.
+  if (!tgt || tgt.followId == null) {
+    rider._prevGapAhead = undefined          // pas de suivi → pas de mémoire de gap
+    return plan.target.frac
+  }
+
+  // Cible de roue : régulation de distance.
+  const follow = (context.riders ?? []).find(r => r.id === tgt.followId)
+  if (!follow) {                             // roue disparue → repli sur l'instinct
+    rider._prevGapAhead = undefined
+    return plan.target.frac
+  }
+
+  const gradient = route?.getGradientAt ? route.getGradientAt(rider.splinePos) : 0
+  const ftpW     = rider.energy.ftpWatts * (rider.energy.dayFormMod ?? 1)
+  const myMass   = rider.profile?.mass
+  const wheelV   = Math.max(1, follow.speedKmh ?? rider.speedKmh ?? 1)
+
+  const gap     = follow.splinePos - rider.splinePos
+  const distErr = gap - tgt.gapCible         // >0 = trop loin, j'accélère (ex-corrKmh)
+  const dGap    = Number.isFinite(rider._prevGapAhead) ? gap - rider._prevGapAhead : 0
+  rider._prevGapAhead = gap
+
+  const wRatio  = rider.energy.wPrime.current / Math.max(1, rider.energy.wPrime.max)
+  const react   = C2_REACT_UP * (wRatio < 0.3 ? C2_REACT_W_FATIGUE : 1)
+  const reactKmh = Math.max(0, dGap) * react * 3.6           // réaction à l'accélération
+  const corrKmh  = Math.max(-2, Math.min(4, distErr)) * 0.4  // correction de distance
+
+  const draftFrac = draftReduction(rider.screenCount ?? 0, wheelV)
+  const vCible    = wheelV + reactKmh + corrKmh
+  const pNeed     = powerForSpeed(vCible, gradient, 1 - draftFrac, myMass)
+  return Math.max(0.50, Math.min(1.50, pNeed / ftpW))
 }
 
 // ─── Veto physiologique — post-clamp nommé (hors concours) ──────────────────
